@@ -1,0 +1,114 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 140 10% 10%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 140 10% 10%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 140 10% 10%;
+
+    --primary: 142 50% 45%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 35 40% 45%;
+    --secondary-foreground: 0 0% 100%;
+
+    --muted: 140 5% 95%;
+    --muted-foreground: 140 5% 45%;
+
+    --accent: 85 45% 45%;
+    --accent-foreground: 0 0% 100%;
+
+    --destructive: 0 65% 50%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 140 5% 85%;
+    --input: 140 5% 85%;
+    --ring: 142 50% 45%;
+
+    --radius: 0.75rem;
+
+    --earth-warm: 30 35% 65%;
+    --earth-soil: 25 20% 55%;
+    --vegetation-high: 142 60% 45%;
+    --vegetation-medium: 80 50% 45%;
+    --vegetation-low: 35 60% 50%;
+    --vegetation-none: 0 50% 50%;
+
+    --sidebar-background: 0 0% 98%;
+    --sidebar-foreground: 140 10% 10%;
+    --sidebar-primary: 142 50% 45%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 140 5% 95%;
+    --sidebar-accent-foreground: 140 10% 10%;
+    --sidebar-border: 140 5% 85%;
+    --sidebar-ring: 142 50% 45%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html {
+    font-size: 16px;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 1rem;
+    line-height: 1.5;
+  }
+
+  h1 {
+    font-size: 2rem;
+    line-height: 1.2;
+  }
+
+  h2 {
+    font-size: 1.5rem;
+    line-height: 1.3;
+  }
+
+  h3 {
+    font-size: 1.25rem;
+    line-height: 1.4;
+  }
+
+  h4 {
+    font-size: 1.125rem;
+    line-height: 1.4;
+  }
+
+  p, li, span, a, button, input, textarea, select {
+    font-size: 1rem;
+  }
+
+  small, .text-sm {
+    font-size: 0.875rem;
+  }
+}
+
+@layer components {
+  .analysis-popup {
+    @apply bg-white/95 backdrop-blur-xl border border-border rounded-xl shadow-2xl;
+    box-shadow: 0 0 40px hsl(var(--primary) / 0.15), 0 20px 60px rgba(0, 0, 0, 0.1);
+    font-size: 1rem;
+  }
+
+  .glow-ring {
+    box-shadow: 0 0 0 2px hsl(var(--primary) / 0.3), 0 0 20px hsl(var(--primary) / 0.2);
+  }
+
+  .mono {
+    font-family: 'IBM Plex Mono', monospace;
+  }
+}
