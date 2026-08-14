@@ -23,7 +23,7 @@ const mapOptions: google.maps.MapOptions = {
   mapTypeId: "satellite",
   disableDefaultUI: true,
   zoomControl: true,
-  zoomControlOptions: { position: 9 /* RIGHT_BOTTOM */ },
+  zoomControlOptions: { position: 6 /* LEFT_BOTTOM */ },
   mapTypeControl: false,
   streetViewControl: false,
   fullscreenControl: false,
@@ -229,7 +229,7 @@ export default function SatelliteMap() {
       {/* Dashboard link */}
       <button
         onClick={() => navigate("/dashboard")}
-        className="absolute bottom-8 right-20 z-[850] analysis-popup px-4 py-3 flex items-center gap-2 hover:scale-105 transition-transform"
+        className="absolute bottom-8 left-20 z-[850] analysis-popup px-4 py-3 flex items-center gap-2 hover:scale-105 transition-transform"
       >
         <BarChart3 className="w-4 h-4 text-primary" />
         <span className="text-sm text-foreground font-medium">Tableau de bord</span>

@@ -113,7 +113,7 @@ export default function CoordinateInput({ onNavigate, onSearch, search, isSearch
   }
 
   return (
-    <div className="absolute top-4 right-4 z-[800] analysis-popup p-4 w-[min(20rem,calc(100vw-2rem))] max-h-[calc(100vh-2rem)] overflow-y-auto">
+    <div className="absolute top-4 right-4 bottom-24 sm:bottom-auto z-[800] analysis-popup p-4 w-[min(20rem,calc(100vw-2rem))] max-h-none sm:max-h-[calc(100vh-2rem)] overflow-y-auto">
       <div className="flex items-center justify-between mb-3">
         <div className="flex items-center gap-2">
           <Radar className="w-4 h-4 text-primary" />

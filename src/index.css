@@ -111,4 +111,8 @@
   .mono {
     font-family: 'IBM Plex Mono', monospace;
   }
+
+  .gm-bundled-control {
+    margin-left: 0 !important;
+  }
 }
