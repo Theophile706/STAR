@@ -229,48 +229,10 @@ export default function SatelliteMap() {
       {/* Dashboard link */}
       <button
         onClick={() => navigate("/dashboard")}
-        className="absolute bottom-8 right-4 z-[850] analysis-popup px-4 py-3 flex items-center gap-2 hover:scale-105 transition-transform"
+        className="absolute bottom-8 right-20 z-[850] analysis-popup px-4 py-3 flex items-center gap-2 hover:scale-105 transition-transform"
       >
         <BarChart3 className="w-4 h-4 text-primary" />
         <span className="text-sm text-foreground font-medium">Tableau de bord</span>
-      </button>
-
-      {/* Export barley image */}
-      <button
-        onClick={() => {
-          if (!searchResult) return;
-          const key = GOOGLE_MAPS_API_KEY;
-          if (!key) {
-            alert("Google Maps API key manquante pour l'export d'image.");
-            return;
-          }
-          const center = `${searchResult.center.lat},${searchResult.center.lng}`;
-          const size = "640x640";
-          const maptype = "satellite";
-          const scale = 2;
-
-          // Only include parcels where barley was detected or probable
-          const barleyParcels = searchResult.parcels.filter((p) => p.analysis?.barley_presence === "confirmed" || p.analysis?.barley_presence === "probable");
-
-          const pathParams: string[] = [];
-          // Add circle approximation for analysis radius
-          const circlePoints = generateCirclePoints(searchResult.center.lat, searchResult.center.lng, searchResult.radius_km, 64);
-          pathParams.push(`path=fillcolor:0x00000000|color:0xFFFF00FF|weight:2|${circlePoints.map((pt) => `${pt.lat},${pt.lng}`).join("|")}`);
-
-          barleyParcels.forEach((parcel) => {
-            const color = parcel.analysis?.barley_presence === "confirmed" ? "0xFFFF00" : "0xFF9900"; // yellow / orange
-            const fill = parcel.analysis?.barley_presence === "confirmed" ? "0xFFFF0033" : "0xFF990033";
-            const coords = parcel.coordinates.map((c) => `${c.lat},${c.lng}`).join("|");
-            pathParams.push(`path=fillcolor:${fill}|color:${color}|weight:1|${coords}`);
-          });
-
-          const url = `https://maps.googleapis.com/maps/api/staticmap?center=${encodeURIComponent(center)}&maptype=${maptype}&size=${size}&scale=${scale}&key=${encodeURIComponent(key)}&${pathParams.join("&")}`;
-          window.open(url, "_blank");
-        }}
-        className="absolute bottom-20 right-4 z-[850] analysis-popup px-3 py-2 flex items-center gap-2 hover:scale-105 transition-transform"
-        title="Exporter image : orge dans le rayon"
-      >
-        <span className="text-sm text-foreground font-medium">Exporter image orge</span>
       </button>
 
       {located && !searchResult && !isSearching && (
@@ -284,8 +246,8 @@ export default function SatelliteMap() {
       {searchResult && (
         <div className="absolute bottom-8 left-4 right-32 sm:left-1/2 sm:right-auto sm:-translate-x-1/2 sm:max-w-lg z-[800] analysis-popup px-4 py-2.5 animate-fade-in">
           <p className="text-xs text-muted-foreground">
-            <span className="inline-block w-2.5 h-2.5 rounded-sm bg-yellow-400 mr-2 align-middle" />
-            {confirmedBarleyCount} orge confirmée · <span className="inline-block w-2.5 h-2.5 rounded-sm bg-orange-400 mx-2 align-middle" />{probableBarleyCount} zone(s) probable(s) · {searchResult.candidates_found} parcelle(s) agricole(s)
+            <span className="inline-block w-2.5 h-2.5 rounded-sm bg-orange-400 mr-2 align-middle" />
+            {probableBarleyCount} zone(s) probable(s) · {searchResult.candidates_found} parcelle(s) agricole(s)
           </p>
         </div>
       )}
@@ -304,18 +266,4 @@ function boundsForRadius(lat: number, lng: number, radiusKm: number): google.map
     east: lng + lngDelta,
     west: lng - lngDelta,
   };
-}
-
-function generateCirclePoints(lat: number, lng: number, radiusKm: number, segments = 64) {
-  const coords: Array<{ lat: number; lng: number }> = [];
-  const R = 6371; // Earth radius km
-  const centerLat = (lat * Math.PI) / 180;
-  const centerLng = (lng * Math.PI) / 180;
-  for (let i = 0; i < segments; i++) {
-    const theta = (2 * Math.PI * i) / segments;
-    const latR = Math.asin(Math.sin(centerLat) * Math.cos(radiusKm / R) + Math.cos(centerLat) * Math.sin(radiusKm / R) * Math.cos(theta));
-    const lngR = centerLng + Math.atan2(Math.sin(theta) * Math.sin(radiusKm / R) * Math.cos(centerLat), Math.cos(radiusKm / R) - Math.sin(centerLat) * Math.sin(latR));
-    coords.push({ lat: (latR * 180) / Math.PI, lng: (lngR * 180) / Math.PI });
-  }
-  return coords;
 }

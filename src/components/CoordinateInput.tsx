@@ -20,7 +20,7 @@ export default function CoordinateInput({ onNavigate, onSearch, search, isSearch
   const [radiusKm, setRadiusKm] = useState("10");
   const [baseTemperature, setBaseTemperature] = useState(String(DEFAULT_BARLEY_DETECTION_CONFIG.baseTemperature));
   const [threshold, setThreshold] = useState(String(DEFAULT_BARLEY_DETECTION_CONFIG.threshold));
-  const [periodDays, setPeriodDays] = useState(String(DEFAULT_BARLEY_DETECTION_CONFIG.periodDays));
+  const [periodDays, setPeriodDays] = useState("130");
   const [expanded, setExpanded] = useState(true);
   const [validationError, setValidationError] = useState("");
   const [isLocating, setIsLocating] = useState(false);
@@ -129,19 +129,6 @@ export default function CoordinateInput({ onNavigate, onSearch, search, isSearch
       <p className="text-xs text-muted-foreground mb-1">La recherche utilise les contours agricoles, les images satellite et le modèle HF avant d’afficher les parcelles d’orge.</p>
       <p className="text-xs text-muted-foreground mb-3">Astuce : glissez ou touchez le repère vert sur la carte pour choisir un point, les coordonnées se remplissent automatiquement.</p>
       <form onSubmit={handleSubmit} className="space-y-2">
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          className="w-full gap-2"
-          onClick={handleUseMyLocation}
-          disabled={isLocating}
-        >
-          {isLocating
-            ? <span key="icon" className="w-3.5 h-3.5 rounded-full border-2 border-primary/40 border-t-primary animate-spin" />
-            : <LocateFixed key="icon" className="w-4 h-4" />}
-          <span key="label">{isLocating ? "Localisation en cours..." : "Utiliser ma position"}</span>
-        </Button>
         {locationError && <p className="text-xs text-destructive">{locationError}</p>}
         <Input
           type="number"
