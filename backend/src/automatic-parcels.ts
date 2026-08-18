@@ -44,9 +44,21 @@ const OVERPASS_API_URLS = [
   "https://overpass.kumi.systems/api/interpreter",
 ];
 const OVERPASS_USER_AGENT = process.env.OVERPASS_USER_AGENT ?? "fieldscan-ai/1.0 (+https://localhost)";
-const MAX_CANDIDATES = 30;
+const MAX_CANDIDATES = 48;
+const MAX_SATELLITE_CELLS = 36;
 const ANALYSIS_CONCURRENCY = 2;
+const AUTOMATIC_SEGMENT_LABEL_PREFIX = "automatic-orge-segment:";
 const prisma = new PrismaClient();
+
+// ── Segmentation automatique des limites de parcelles (image satellite) ──
+const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
+const FIELD_SEGMENTATION_MODEL_URL = process.env.FIELD_SEGMENTATION_MODEL_URL;
+const SEGMENTATION_IMAGE_SIZE = 640;
+const SEGMENTATION_MARGIN_FACTOR = 1.3;
+// Au-delà de ce rayon, la résolution d'une image 640x640 devient trop grossière
+// pour distinguer des limites de champs individuelles : on repasse sur la grille.
+const MAX_SEGMENTATION_RADIUS_KM = 3;
+const SEGMENTATION_MIN_POLYGON_AREA_M2 = 200;
 
 type OverpassElement = {
   type?: string;
@@ -60,7 +72,8 @@ export async function detectAutomaticParcels({ lat, lng, radiusKm, baseTemperatu
     const candidates = await discoverAgriculturalParcels(lat, lng, radiusKm);
     const config = { baseTemperature, threshold, periodDays };
     const analyzedCandidates = candidates.slice(0, MAX_CANDIDATES);
-    const satelliteWindowFallback = analyzedCandidates.some((candidate) => candidate.tags.source === "satellite-search-window");
+    const segmentationFallback = analyzedCandidates.some((candidate) => candidate.tags.source === "satellite-segmentation");
+    const satelliteWindowFallback = !segmentationFallback && analyzedCandidates.some((candidate) => candidate.tags.source?.startsWith("satellite-search"));
     const analyzedParcels = await mapWithConcurrency(analyzedCandidates, ANALYSIS_CONCURRENCY, (candidate) => analyzeCandidate(candidate, config));
     const analyzedIds = new Set(analyzedCandidates.map((candidate) => candidate.id));
     const parcels = [
@@ -83,11 +96,13 @@ export async function detectAutomaticParcels({ lat, lng, radiusKm, baseTemperatu
       candidates_found: candidates.length,
       analyzed_count: parcels.filter((parcel) => parcel.analysis !== null).length,
       parcels,
-      notice: satelliteWindowFallback
-        ? "Aucun contour vectoriel n’a été trouvé : une zone satellite autour du point a été analysée sans créer de fausse parcelle en base."
-        : candidates.length === 0
-          ? "Aucun contour agricole fiable n’est référencé dans ce rayon."
-          : null,
+      notice: segmentationFallback
+        ? "Aucun contour vectoriel référencé : les limites de parcelles ont été détectées automatiquement par segmentation d’image satellite (IA)."
+        : satelliteWindowFallback
+          ? "Aucun contour vectoriel n’a été trouvé : plusieurs cellules satellite autour du point sont analysées sans créer de fausse parcelle en base."
+          : candidates.length === 0
+            ? "Aucun contour agricole fiable n’est référencé dans ce rayon."
+            : null,
     };
   } catch (error) {
     // On erreur (DB, Overpass, etc.) renvoyer un fallback lisible pour le frontend
@@ -116,7 +131,14 @@ async function discoverAgriculturalParcels(lat: number, lng: number, radiusKm: n
   const databaseCandidates = await discoverAgriculturalParcelsFromDatabase(lat, lng, radiusKm);
   if (databaseCandidates.length > 0) return ensureCoordinateCoverage(databaseCandidates, lat, lng, radiusKm);
 
-  return [createSatelliteSearchWindowCandidate(lat, lng, radiusKm)];
+  try {
+    const segmentedCandidates = await discoverAgriculturalParcelsFromSegmentation(lat, lng, radiusKm);
+    if (segmentedCandidates.length > 0) return ensureCoordinateCoverage(segmentedCandidates, lat, lng, radiusKm);
+  } catch (error) {
+    console.warn("discoverAgriculturalParcelsFromSegmentation failed, falling back to grid:", error);
+  }
+
+  return createSatelliteSearchCellCandidates(lat, lng, radiusKm);
 }
 
 function ensureCoordinateCoverage(candidates: CandidateParcel[], lat: number, lng: number, radiusKm: number): CandidateParcel[] {
@@ -125,22 +147,208 @@ function ensureCoordinateCoverage(candidates: CandidateParcel[], lat: number, ln
     if (coordinates.length < 3) return [];
     return [{ ...candidate, coordinates, center: polygonCenter(coordinates) }];
   });
-  if (constrainedCandidates.some((candidate) => pointInPolygon({ lat, lng }, candidate.coordinates))) return constrainedCandidates;
-  return [
-    ...constrainedCandidates.slice(0, Math.max(0, MAX_CANDIDATES - 1)),
-    createSatelliteSearchWindowCandidate(lat, lng, radiusKm),
-  ];
+  const satelliteCells = createSatelliteSearchCellCandidates(lat, lng, radiusKm)
+    .filter((cell) => !constrainedCandidates.some((candidate) => pointInPolygon(cell.center, candidate.coordinates)));
+  return [...constrainedCandidates, ...satelliteCells].slice(0, MAX_CANDIDATES);
 }
 
-function createSatelliteSearchWindowCandidate(lat: number, lng: number, radiusKm: number): CandidateParcel {
-  const windowRadiusKm = Math.min(5, Math.max(0.05, radiusKm));
+function createSatelliteSearchCellCandidates(lat: number, lng: number, radiusKm: number): CandidateParcel[] {
+  const center = { lat, lng };
+  const cellSizeKm = Math.max(0.1, radiusKm / Math.sqrt(MAX_SATELLITE_CELLS / Math.PI));
+  const halfCellKm = cellSizeKm / 2;
+  const cellCount = Math.ceil(radiusKm / cellSizeKm);
+  const cells: CandidateParcel[] = [];
+
+  for (let row = -cellCount; row <= cellCount; row++) {
+    for (let column = -cellCount; column <= cellCount; column++) {
+      const cellCenter = offsetPoint(center, column * cellSizeKm, row * cellSizeKm);
+      if (distanceBetweenPoints(center, cellCenter) > radiusKm + halfCellKm) continue;
+      const cell = squareAround(cellCenter, halfCellKm);
+      const coordinates = clipPolygonToRadius(cell, center, radiusKm);
+      if (coordinates.length < 3) continue;
+      cells.push({
+        id: `satellite-search-cell-${lat.toFixed(6)}-${lng.toFixed(6)}-${row}-${column}`,
+        coordinates,
+        center: polygonCenter(coordinates),
+        tags: { source: "satellite-search-cell" },
+        persist: false,
+      });
+    }
+  }
+
+  return cells
+    .sort((left, right) => distanceBetweenPoints(center, left.center) - distanceBetweenPoints(center, right.center))
+    .slice(0, MAX_SATELLITE_CELLS);
+}
+
+// ── Web Mercator : conversion pixel image <-> lat/lng (même projection que les tuiles Google Maps) ──
+const WORLD_TILE_SIZE = 256;
+
+function latLngToWorldPoint(lat: number, lng: number): { x: number; y: number } {
+  const sinY = Math.min(Math.max(Math.sin((lat * Math.PI) / 180), -0.9999), 0.9999);
   return {
-    id: `satellite-search-window-${lat.toFixed(6)}-${lng.toFixed(6)}`,
-    coordinates: radiusPolygon({ lat, lng }, windowRadiusKm),
-    center: { lat, lng },
-    tags: { source: "satellite-search-window" },
-    persist: false,
+    x: WORLD_TILE_SIZE * (0.5 + lng / 360),
+    y: WORLD_TILE_SIZE * (0.5 - Math.log((1 + sinY) / (1 - sinY)) / (4 * Math.PI)),
   };
+}
+
+function worldPointToLatLng(x: number, y: number): { lat: number; lng: number } {
+  const lng = (x / WORLD_TILE_SIZE - 0.5) * 360;
+  const n = Math.PI - (2 * Math.PI * y) / WORLD_TILE_SIZE;
+  const lat = (180 / Math.PI) * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
+  return { lat, lng };
+}
+
+/** Convertit un pixel (origine en haut à gauche) d'une image Static Maps en lat/lng. */
+function pixelToLatLng(
+  px: number,
+  py: number,
+  center: { lat: number; lng: number },
+  zoom: number,
+  imageWidthPx: number,
+  imageHeightPx: number,
+): { lat: number; lng: number } {
+  const scale = 2 ** zoom;
+  const centerWorld = latLngToWorldPoint(center.lat, center.lng);
+  const centerPixel = { x: centerWorld.x * scale, y: centerWorld.y * scale };
+  const originPixel = { x: centerPixel.x - imageWidthPx / 2, y: centerPixel.y - imageHeightPx / 2 };
+  const worldX = (originPixel.x + px) / scale;
+  const worldY = (originPixel.y + py) / scale;
+  return worldPointToLatLng(worldX, worldY);
+}
+
+/** Zoom Static Maps le plus élevé qui garde le disque de rayon radiusKm dans l'image. */
+function zoomToFitRadius(lat: number, radiusKm: number, imageSizePx: number): number {
+  const diameterMeters = 2 * radiusKm * 1000 * SEGMENTATION_MARGIN_FACTOR;
+  const metersPerPixelAtZoom0 = 156_543.03392 * Math.cos((lat * Math.PI) / 180);
+  const rawZoom = Math.log2((metersPerPixelAtZoom0 * imageSizePx) / diameterMeters);
+  return Math.min(20, Math.max(1, Math.floor(rawZoom)));
+}
+
+function polygonAreaM2(polygon: Array<{ lat: number; lng: number }>): number {
+  if (polygon.length < 3) return 0;
+  const longitudeScale = Math.max(Math.abs(Math.cos((polygon[0].lat * Math.PI) / 180)), 0.1);
+  const toMeters = (point: { lat: number; lng: number }) => ({
+    x: point.lng * 111_320 * longitudeScale,
+    y: point.lat * 110_574,
+  });
+  const points = polygon.map(toMeters);
+  let sum = 0;
+  for (let i = 0; i < points.length; i++) {
+    const a = points[i];
+    const b = points[(i + 1) % points.length];
+    sum += a.x * b.y - b.x * a.y;
+  }
+  return Math.abs(sum) / 2;
+}
+
+async function fetchSatelliteImageBase64(
+  lat: number,
+  lng: number,
+  zoom: number,
+  sizePx: number,
+): Promise<string> {
+  if (!GOOGLE_MAPS_API_KEY || GOOGLE_MAPS_API_KEY.startsWith("VOTRE_")) {
+    throw new Error("GOOGLE_MAPS_API_KEY n’est pas configurée.");
+  }
+  const params = new URLSearchParams({
+    center: `${lat},${lng}`,
+    zoom: String(zoom),
+    size: `${sizePx}x${sizePx}`,
+    maptype: "satellite",
+    key: GOOGLE_MAPS_API_KEY,
+  });
+  const response = await fetch(`https://maps.googleapis.com/maps/api/staticmap?${params.toString()}`, {
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (!response.ok) throw new Error(`Google Maps Static API error: ${response.status}`);
+  const arrayBuffer = await response.arrayBuffer();
+  const bytes = new Uint8Array(arrayBuffer);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+
+interface SegmentationPolygonResponse {
+  /** Coordonnées en pixels, origine en haut à gauche de l'image envoyée. */
+  points: Array<{ x: number; y: number }>;
+  score?: number;
+  label?: string;
+}
+
+interface SegmentationModelResponse {
+  polygons: SegmentationPolygonResponse[];
+  image_width?: number;
+  image_height?: number;
+}
+
+/**
+ * Appelle un modèle externe de segmentation de champs (ex: un Space HF basé sur
+ * SAM / un modèle de délinéation parcellaire) sur une image satellite statique,
+ * puis géoréférence les polygones retournés (en pixels) vers des lat/lng.
+ *
+ * Contrat attendu côté modèle : POST multipart "file" -> image satellite (PNG/JPEG),
+ * réponse JSON { polygons: [{ points: [{x,y}, ...], score?, label? }, ...] }
+ * avec des coordonnées pixels dans le repère de l'image envoyée (haut-gauche = origine).
+ */
+async function callFieldSegmentationModel(imageBase64: string): Promise<SegmentationModelResponse> {
+  const binaryStr = atob(imageBase64);
+  const bytes = new Uint8Array(binaryStr.length);
+  for (let i = 0; i < binaryStr.length; i++) bytes[i] = binaryStr.charCodeAt(i);
+
+  const formData = new FormData();
+  formData.append("file", new Blob([bytes], { type: "image/png" }), "parcel-area.png");
+
+  const response = await fetch(`${FIELD_SEGMENTATION_MODEL_URL}/segment`, {
+    method: "POST",
+    body: formData,
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`Modèle de segmentation : erreur ${response.status} ${text.slice(0, 300)}`);
+  }
+  const data: unknown = await response.json();
+  if (!data || typeof data !== "object" || !Array.isArray((data as Record<string, unknown>).polygons)) {
+    throw new Error("Réponse du modèle de segmentation invalide (champ 'polygons' manquant).");
+  }
+  return data as SegmentationModelResponse;
+}
+
+async function discoverAgriculturalParcelsFromSegmentation(
+  lat: number,
+  lng: number,
+  radiusKm: number,
+): Promise<CandidateParcel[]> {
+  if (!FIELD_SEGMENTATION_MODEL_URL) return [];
+  if (radiusKm > MAX_SEGMENTATION_RADIUS_KM) return [];
+
+  const zoom = zoomToFitRadius(lat, radiusKm, SEGMENTATION_IMAGE_SIZE);
+  const imageBase64 = await fetchSatelliteImageBase64(lat, lng, zoom, SEGMENTATION_IMAGE_SIZE);
+  const result = await callFieldSegmentationModel(imageBase64);
+  const imageWidth = result.image_width ?? SEGMENTATION_IMAGE_SIZE;
+  const imageHeight = result.image_height ?? SEGMENTATION_IMAGE_SIZE;
+  const center = { lat, lng };
+
+  return result.polygons.flatMap((polygon, index): CandidateParcel[] => {
+    if (!Array.isArray(polygon.points) || polygon.points.length < 3) return [];
+    const coordinates = polygon.points.flatMap((point) => {
+      if (typeof point.x !== "number" || typeof point.y !== "number") return [];
+      return [pixelToLatLng(point.x, point.y, center, zoom, imageWidth, imageHeight)];
+    });
+    if (coordinates.length < 3) return [];
+    if (polygonAreaM2(coordinates) < SEGMENTATION_MIN_POLYGON_AREA_M2) return [];
+    return [{
+      id: `segmentation-${lat.toFixed(6)}-${lng.toFixed(6)}-${index}`,
+      coordinates,
+      center: polygonCenter(coordinates),
+      tags: {
+        source: "satellite-segmentation",
+        ...(polygon.label ? { crop_hint: polygon.label } : {}),
+        ...(typeof polygon.score === "number" ? { segmentation_score: String(polygon.score) } : {}),
+      },
+    }];
+  });
 }
 
 async function discoverAgriculturalParcelsFromOverpass(lat: number, lng: number, radiusKm: number): Promise<CandidateParcel[]> {
@@ -207,6 +415,7 @@ async function discoverAgriculturalParcelsFromDatabase(lat: number, lng: number,
       where: {
         center_lat: { gte: minLat, lte: maxLat },
         center_lng: { gte: minLng, lte: maxLng },
+        NOT: { label: { startsWith: AUTOMATIC_SEGMENT_LABEL_PREFIX } },
       },
     });
   } catch (error) {
@@ -271,6 +480,30 @@ function polygonCenter(points: Array<{ lat: number; lng: number }>): { lat: numb
     lat: points.reduce((sum, point) => sum + point.lat, 0) / points.length,
     lng: points.reduce((sum, point) => sum + point.lng, 0) / points.length,
   };
+}
+
+function offsetPoint(center: { lat: number; lng: number }, eastKm: number, northKm: number): { lat: number; lng: number } {
+  const longitudeScale = Math.max(Math.abs(Math.cos((center.lat * Math.PI) / 180)), 0.1);
+  return {
+    lat: center.lat + northKm / 110.574,
+    lng: center.lng + eastKm / (111.32 * longitudeScale),
+  };
+}
+
+function distanceBetweenPoints(left: { lat: number; lng: number }, right: { lat: number; lng: number }): number {
+  const longitudeScale = Math.max(Math.abs(Math.cos((left.lat * Math.PI) / 180)), 0.1);
+  const eastKm = (right.lng - left.lng) * 111.32 * longitudeScale;
+  const northKm = (right.lat - left.lat) * 110.574;
+  return Math.hypot(eastKm, northKm);
+}
+
+function squareAround(center: { lat: number; lng: number }, halfSideKm: number): Array<{ lat: number; lng: number }> {
+  return [
+    offsetPoint(center, -halfSideKm, -halfSideKm),
+    offsetPoint(center, halfSideKm, -halfSideKm),
+    offsetPoint(center, halfSideKm, halfSideKm),
+    offsetPoint(center, -halfSideKm, halfSideKm),
+  ];
 }
 
 function radiusPolygon(center: { lat: number; lng: number }, radiusKm: number): Array<{ lat: number; lng: number }> {
@@ -487,6 +720,81 @@ async function saveAutomaticAnalysis(candidate: CandidateParcel, analysis: Recor
   } else {
     await prisma.parcelle.create({ data });
   }
+
+  await saveDetectedBarleySegments(candidate, analysis);
+}
+
+async function saveDetectedBarleySegments(candidate: CandidateParcel, analysis: Record<string, unknown>): Promise<void> {
+  const labelPrefix = `${AUTOMATIC_SEGMENT_LABEL_PREFIX}${candidate.id}:`;
+  await prisma.parcelle.deleteMany({ where: { label: { startsWith: labelPrefix } } });
+
+  const rawSegments = Array.isArray(analysis.detected_segments) ? analysis.detected_segments : [];
+  for (const [index, rawSegment] of rawSegments.entries()) {
+    if (!rawSegment || typeof rawSegment !== "object") continue;
+    const segment = rawSegment as Record<string, unknown>;
+    const coordinates = asCoordinateArray(segment.coordinates);
+    const confidence = asNumber(segment.confidence);
+    const areaHa = asNumber(segment.area_ha);
+    if (!coordinates || confidence == null || areaHa == null) continue;
+
+    const ndvi = asNumber(segment.ndvi);
+    const ndviPercentage = ndvi == null ? null : Math.round(ndvi * 1000) / 10;
+    const label = `${labelPrefix}${index}`;
+    const data: Prisma.ParcelleUncheckedCreateInput = {
+      label,
+      coordinates,
+      center_lat: coordinates.reduce((sum, point) => sum + point.lat, 0) / coordinates.length,
+      center_lng: coordinates.reduce((sum, point) => sum + point.lng, 0) / coordinates.length,
+      surface_ha: areaHa,
+      culture_declared: asString(analysis.culture_declared),
+      culture_detected: "Orge",
+      ndvi_percentage: ndviPercentage,
+      confidence,
+      verdict: "CONFORME",
+      details: `Segment d’orge détecté automatiquement (${confidence}%).`,
+      saison: asString(analysis.saison),
+      soil_type: asString(analysis.soil_type),
+      risk_factors: asStringArray(analysis.risk_factors),
+      recommendations: asString(analysis.recommendations),
+      data_source: `${asString(analysis.data_source) ?? "Analyse automatique"} + Segmentation d’orge`,
+      owner_name: asString(candidate.tags.owner) ?? "Orge détectée",
+      notes: "Contour d’orge détecté automatiquement.",
+      time_series_s1: Array.isArray(analysis.time_series_s1) ? analysis.time_series_s1 : [],
+      time_series_s2: Array.isArray(analysis.time_series_s2) ? analysis.time_series_s2 : [],
+      estimated_planting_date: asString(analysis.estimated_planting_date),
+      estimated_harvest_date: asString(analysis.estimated_harvest_date),
+      days_since_planting: Number.isInteger(analysis.days_since_planting) ? analysis.days_since_planting as number : null,
+      growth_stage: asString(analysis.growth_stage),
+      planting_confidence: asNumber(analysis.planting_confidence),
+      evi: asNumber(analysis.evi),
+      savi: asNumber(analysis.savi),
+      ndwi: asNumber(analysis.ndwi),
+      agro_score: asNumber(analysis.agro_score),
+      hybrid_score: asNumber(analysis.hybrid_score),
+      cnn_prob_barley: asNumber(analysis.cnn_prob_barley),
+      cnn_prob_non_barley: asNumber(analysis.cnn_prob_non_barley),
+    };
+
+    const existing = await prisma.parcelle.findFirst({ where: { label }, select: { id: true } });
+    if (existing) {
+      await prisma.parcelle.update({ where: { id: existing.id }, data });
+    } else {
+      await prisma.parcelle.create({ data });
+    }
+  }
+}
+
+function asCoordinateArray(value: unknown): Array<{ lat: number; lng: number }> | null {
+  if (!Array.isArray(value)) return null;
+  const coordinates = value.flatMap((point) => {
+    if (!point || typeof point !== "object") return [];
+    const values = point as Record<string, unknown>;
+    return typeof values.lat === "number" && Number.isFinite(values.lat)
+      && typeof values.lng === "number" && Number.isFinite(values.lng)
+      ? [{ lat: values.lat, lng: values.lng }]
+      : [];
+  });
+  return coordinates.length >= 3 ? coordinates : null;
 }
 
 function formatDate(date: Date): string {

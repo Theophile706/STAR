@@ -185,12 +185,12 @@ export default function SatelliteMap() {
     if (!drawnParcel || !mapRef.current) return;
     drawnPolygonRef.current = new google.maps.Polygon({
       paths: drawnParcel.points,
-      strokeColor: "#fbbf24",
-      strokeWeight: 3,
-      strokeOpacity: 0.98,
-      fillColor: "#facc15",
-      fillOpacity: 0.12,
-      zIndex: 30,
+      strokeColor: "#ef4444",
+      strokeWeight: 5,
+      strokeOpacity: 1,
+      fillColor: "#ef4444",
+      fillOpacity: 0.18,
+      zIndex: 40,
       map: mapRef.current,
     });
   }, [drawnParcel]);
@@ -248,8 +248,8 @@ export default function SatelliteMap() {
         </div>
       </div>
 
-      {/* Existing saved parcel overlays stay hidden while the current search is displayed. */}
-      {!searchResult && !isSearching && <ParcelOverlays map={mapRef.current} parcelles={parcelles} />}
+      {/* Parcelles enregistrées dans la base de données */}
+      <ParcelOverlays map={mapRef.current} parcelles={parcelles} />
 
       {/* Parcels discovered from the GPS search */}
       <AutomaticParcelOverlays map={mapRef.current} parcels={searchResult?.parcels ?? []} />
@@ -300,7 +300,7 @@ export default function SatelliteMap() {
         <div className="absolute bottom-8 left-4 right-32 sm:left-1/2 sm:right-auto sm:-translate-x-1/2 sm:max-w-lg z-[800] analysis-popup px-4 py-2.5 animate-fade-in">
           <p className="text-xs text-muted-foreground">
             <span className="inline-block w-2.5 h-2.5 rounded-sm border-2 border-yellow-400 mr-2 align-middle" />
-            {displayedBarleySegmentCount} contour(s) d’orge détecté(s) · {searchResult.candidates_found} parcelle(s) agricole(s)
+            {displayedBarleySegmentCount} contour(s) d’orge détecté(s) · {searchResult.candidates_found} zone(s) analysée(s)
           </p>
         </div>
       )}

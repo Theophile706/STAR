@@ -209,14 +209,14 @@ export default function CoordinateInput({ onNavigate, onSearch, search, isSearch
           <div className="grid grid-cols-2 gap-2 text-center">
             <div className="rounded-md bg-background/60 p-2">
               <p className="text-lg font-semibold text-foreground">{search.candidates_found}</p>
-              <p className="text-[10px] text-muted-foreground">parcelles trouvées</p>
+              <p className="text-[10px] text-muted-foreground">zones candidates</p>
             </div>
             <div className="rounded-md bg-yellow-300/30 p-2">
               <p className="text-lg font-semibold text-yellow-700">{detectedSegments.length}</p>
               <p className="text-[10px] text-yellow-800">objets d’orge</p>
             </div>
           </div>
-          <p className="text-[11px] text-muted-foreground">Rayon terrain réel : {search.radius_km} km · {search.analyzed_count} zone(s) analysée(s), puis segmentée(s) par SNIC avant la classification HF.</p>
+          <p className="text-[11px] text-muted-foreground">Rayon terrain réel : {search.radius_km} km · {search.analyzed_count} zone(s) analysée(s) par cellules, puis segmentée(s) par SNIC avant la classification HF.</p>
           <p className="text-[11px] text-muted-foreground">Degrés-jours requis : {search.threshold} °C · Tbase : {search.base_temperature} °C · période : {search.period_days} jours.</p>
           {search.notice && <p className="rounded-md bg-amber-100/80 px-2 py-1.5 text-[11px] text-amber-900">{search.notice}</p>}
           <p className="text-[11px] text-yellow-800">Jaune : uniquement les objets SNIC que le modèle HF a classifiés comme Orge.</p>

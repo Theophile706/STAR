@@ -27,15 +27,15 @@ export default function AutomaticParcelOverlays({ map, parcels }: AutomaticParce
       const polygon = new google.maps.Polygon({
         paths: path,
         strokeColor: "#fbbf24",
-        strokeWeight: 3,
-        strokeOpacity: 0.98,
+        strokeWeight: 4,
+        strokeOpacity: 1,
         fillColor: "#facc15",
-        fillOpacity: 0.12,
+        fillOpacity: 0.2,
         zIndex: 20,
         map,
       });
       polygon.addListener("mouseover", (event: google.maps.PolyMouseEvent) => {
-        polygon.setOptions({ fillOpacity: 0.3 });
+        polygon.setOptions({ fillOpacity: 0.42, strokeWeight: 5 });
         const content = document.createElement("div");
         content.style.cssText = "font-family:'Space Grotesk',sans-serif;color:#333;min-width:160px;padding:4px";
         const title = document.createElement("strong");
@@ -52,7 +52,7 @@ export default function AutomaticParcelOverlays({ map, parcels }: AutomaticParce
         }
       });
       polygon.addListener("mouseout", () => {
-        polygon.setOptions({ fillOpacity: 0.12 });
+        polygon.setOptions({ fillOpacity: 0.2, strokeWeight: 4 });
         infoWindowRef.current?.close();
       });
       polygonsRef.current.push(polygon);

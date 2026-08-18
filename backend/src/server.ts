@@ -124,6 +124,7 @@ app.post("/api/detect-parcels-fallback", async (request, reply) => {
   const parsed = automaticDetectionSchema.safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: "Coordonnées ou rayon invalides.", details: parsed.error.flatten() });
   const result = await detectAutomaticParcels(parsed.data);
+  parcellesCache = null;
   return reply.send(result);
 });
 
@@ -177,6 +178,7 @@ app.post("/api/detect-parcels", async (request, reply) => {
   if (!parsed.success) return reply.code(400).send({ error: "Coordonnées ou rayon invalides.", details: parsed.error.flatten() });
   try {
     const result = await detectAutomaticParcels(parsed.data);
+    parcellesCache = null;
     return reply.send(result);
   } catch (error) {
     app.log.warn({ err: error }, "detect-parcels: discovery failed, returning fallback notice");
