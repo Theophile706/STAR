@@ -18,6 +18,7 @@ interface CandidateParcel {
   coordinates: Array<{ lat: number; lng: number }>;
   center: { lat: number; lng: number };
   tags: Record<string, string>;
+  persist?: boolean;
 }
 
 export interface AutoDetectedParcel extends CandidateParcel {
@@ -44,7 +45,7 @@ const OVERPASS_API_URLS = [
 ];
 const OVERPASS_USER_AGENT = process.env.OVERPASS_USER_AGENT ?? "fieldscan-ai/1.0 (+https://localhost)";
 const MAX_CANDIDATES = 30;
-const ANALYSIS_CONCURRENCY = 3;
+const ANALYSIS_CONCURRENCY = 2;
 const prisma = new PrismaClient();
 
 type OverpassElement = {
@@ -59,6 +60,7 @@ export async function detectAutomaticParcels({ lat, lng, radiusKm, baseTemperatu
     const candidates = await discoverAgriculturalParcels(lat, lng, radiusKm);
     const config = { baseTemperature, threshold, periodDays };
     const analyzedCandidates = candidates.slice(0, MAX_CANDIDATES);
+    const satelliteWindowFallback = analyzedCandidates.some((candidate) => candidate.tags.source === "satellite-search-window");
     const analyzedParcels = await mapWithConcurrency(analyzedCandidates, ANALYSIS_CONCURRENCY, (candidate) => analyzeCandidate(candidate, config));
     const analyzedIds = new Set(analyzedCandidates.map((candidate) => candidate.id));
     const parcels = [
@@ -81,9 +83,11 @@ export async function detectAutomaticParcels({ lat, lng, radiusKm, baseTemperatu
       candidates_found: candidates.length,
       analyzed_count: parcels.filter((parcel) => parcel.analysis !== null).length,
       parcels,
-      notice: candidates.length === 0
-        ? "Aucun contour agricole n’est référencé dans ce rayon. La zone jaune reste votre périmètre d’analyse ; essayez un rayon plus large ou une position voisine."
-        : null,
+      notice: satelliteWindowFallback
+        ? "Aucun contour vectoriel n’a été trouvé : une zone satellite autour du point a été analysée sans créer de fausse parcelle en base."
+        : candidates.length === 0
+          ? "Aucun contour agricole fiable n’est référencé dans ce rayon."
+          : null,
     };
   } catch (error) {
     // On erreur (DB, Overpass, etc.) renvoyer un fallback lisible pour le frontend
@@ -107,8 +111,36 @@ export async function detectAutomaticParcels({ lat, lng, radiusKm, baseTemperatu
 
 async function discoverAgriculturalParcels(lat: number, lng: number, radiusKm: number): Promise<CandidateParcel[]> {
   const candidates = await discoverAgriculturalParcelsFromOverpass(lat, lng, radiusKm);
-  if (candidates.length > 0) return candidates;
-  return discoverAgriculturalParcelsFromDatabase(lat, lng, radiusKm);
+  if (candidates.length > 0) return ensureCoordinateCoverage(candidates, lat, lng, radiusKm);
+
+  const databaseCandidates = await discoverAgriculturalParcelsFromDatabase(lat, lng, radiusKm);
+  if (databaseCandidates.length > 0) return ensureCoordinateCoverage(databaseCandidates, lat, lng, radiusKm);
+
+  return [createSatelliteSearchWindowCandidate(lat, lng, radiusKm)];
+}
+
+function ensureCoordinateCoverage(candidates: CandidateParcel[], lat: number, lng: number, radiusKm: number): CandidateParcel[] {
+  const constrainedCandidates = candidates.flatMap((candidate) => {
+    const coordinates = clipPolygonToRadius(candidate.coordinates, { lat, lng }, radiusKm);
+    if (coordinates.length < 3) return [];
+    return [{ ...candidate, coordinates, center: polygonCenter(coordinates) }];
+  });
+  if (constrainedCandidates.some((candidate) => pointInPolygon({ lat, lng }, candidate.coordinates))) return constrainedCandidates;
+  return [
+    ...constrainedCandidates.slice(0, Math.max(0, MAX_CANDIDATES - 1)),
+    createSatelliteSearchWindowCandidate(lat, lng, radiusKm),
+  ];
+}
+
+function createSatelliteSearchWindowCandidate(lat: number, lng: number, radiusKm: number): CandidateParcel {
+  const windowRadiusKm = Math.min(5, Math.max(0.05, radiusKm));
+  return {
+    id: `satellite-search-window-${lat.toFixed(6)}-${lng.toFixed(6)}`,
+    coordinates: radiusPolygon({ lat, lng }, windowRadiusKm),
+    center: { lat, lng },
+    tags: { source: "satellite-search-window" },
+    persist: false,
+  };
 }
 
 async function discoverAgriculturalParcelsFromOverpass(lat: number, lng: number, radiusKm: number): Promise<CandidateParcel[]> {
@@ -234,6 +266,80 @@ function distanceToSegment(point: { x: number; y: number }, start: { x: number; 
   return Math.hypot(point.x - (start.x + ratio * dx), point.y - (start.y + ratio * dy));
 }
 
+function polygonCenter(points: Array<{ lat: number; lng: number }>): { lat: number; lng: number } {
+  return {
+    lat: points.reduce((sum, point) => sum + point.lat, 0) / points.length,
+    lng: points.reduce((sum, point) => sum + point.lng, 0) / points.length,
+  };
+}
+
+function radiusPolygon(center: { lat: number; lng: number }, radiusKm: number): Array<{ lat: number; lng: number }> {
+  const radiusM = radiusKm * 1_000;
+  const longitudeScale = Math.max(Math.abs(Math.cos((center.lat * Math.PI) / 180)), 0.1);
+  return Array.from({ length: 48 }, (_, index) => {
+    const angle = (index / 48) * Math.PI * 2;
+    return {
+      lat: center.lat + (Math.sin(angle) * radiusM) / 110_574,
+      lng: center.lng + (Math.cos(angle) * radiusM) / (111_320 * longitudeScale),
+    };
+  });
+}
+
+type LocalPoint = { x: number; y: number };
+
+function clipPolygonToRadius(
+  polygon: Array<{ lat: number; lng: number }>,
+  center: { lat: number; lng: number },
+  radiusKm: number,
+): Array<{ lat: number; lng: number }> {
+  const longitudeScale = Math.max(Math.abs(Math.cos((center.lat * Math.PI) / 180)), 0.1);
+  const toLocal = (point: { lat: number; lng: number }): LocalPoint => ({
+    x: (point.lng - center.lng) * 111_320 * longitudeScale,
+    y: (point.lat - center.lat) * 110_574,
+  });
+  const fromLocal = (point: LocalPoint) => ({
+    lat: center.lat + point.y / 110_574,
+    lng: center.lng + point.x / (111_320 * longitudeScale),
+  });
+  const points = polygon.slice();
+  const first = points[0];
+  const last = points.at(-1);
+  if (first && last && first.lat === last.lat && first.lng === last.lng) points.pop();
+  let clipped = points.map(toLocal);
+  const boundary = radiusPolygon(center, radiusKm).map(toLocal);
+
+  for (let index = 0; index < boundary.length && clipped.length > 0; index++) {
+    const start = boundary[index];
+    const end = boundary[(index + 1) % boundary.length];
+    const input = clipped;
+    clipped = [];
+    for (let pointIndex = 0; pointIndex < input.length; pointIndex++) {
+      const previous = input[(pointIndex + input.length - 1) % input.length];
+      const current = input[pointIndex];
+      const previousInside = crossProduct(start, end, previous) >= 0;
+      const currentInside = crossProduct(start, end, current) >= 0;
+      if (currentInside !== previousInside) clipped.push(lineIntersection(previous, current, start, end));
+      if (currentInside) clipped.push(current);
+    }
+  }
+
+  return clipped.map(fromLocal);
+}
+
+function crossProduct(start: LocalPoint, end: LocalPoint, point: LocalPoint): number {
+  return (end.x - start.x) * (point.y - start.y) - (end.y - start.y) * (point.x - start.x);
+}
+
+function lineIntersection(start: LocalPoint, end: LocalPoint, boundaryStart: LocalPoint, boundaryEnd: LocalPoint): LocalPoint {
+  const direction = { x: end.x - start.x, y: end.y - start.y };
+  const boundaryDirection = { x: boundaryEnd.x - boundaryStart.x, y: boundaryEnd.y - boundaryStart.y };
+  const denominator = direction.x * boundaryDirection.y - direction.y * boundaryDirection.x;
+  if (denominator === 0) return end;
+  const offset = { x: boundaryStart.x - start.x, y: boundaryStart.y - start.y };
+  const ratio = (offset.x * boundaryDirection.y - offset.y * boundaryDirection.x) / denominator;
+  return { x: start.x + ratio * direction.x, y: start.y + ratio * direction.y };
+}
+
 function isParcelWithinRadius(candidate: CandidateParcel, center: { lat: number; lng: number }, radiusKm: number): boolean {
   if (pointInPolygon(center, candidate.coordinates)) return true;
   const longitudeScale = Math.cos((center.lat * Math.PI) / 180);
@@ -308,10 +414,12 @@ async function analyzeCandidate(candidate: CandidateParcel, config: BarleyDetect
     gdd_error: gddError,
   };
 
-  try {
-    await saveAutomaticAnalysis(candidate, analysis);
-  } catch (error) {
-    console.warn(`Automatic analysis ${candidate.id} was not persisted:`, error);
+  if (candidate.persist !== false) {
+    try {
+      await saveAutomaticAnalysis(candidate, analysis);
+    } catch (error) {
+      console.warn(`Automatic analysis ${candidate.id} was not persisted:`, error);
+    }
   }
 
   return { ...candidate, analysis, analysis_error: null };

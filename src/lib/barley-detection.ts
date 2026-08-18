@@ -34,7 +34,8 @@ export const DEFAULT_BARLEY_DETECTION_CONFIG: BarleyDetectionConfig = {
 const round = (value: number) => Math.round(value * 10) / 10;
 
 export function calculateDailyGrowingDegreeDay(tmax: number, tmin: number, baseTemperature: number): number {
-  return round((tmax + tmin) / 2 - baseTemperature);
+  const dj = (tmax + tmin) / 2 - baseTemperature;
+  return round(Math.max(0, dj));
 }
 
 export function summarizeBarleyDetection(

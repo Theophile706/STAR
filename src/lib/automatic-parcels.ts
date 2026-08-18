@@ -2,6 +2,13 @@ import type { BarleyDetectionConfig } from "@/lib/barley-detection";
 
 const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:3001";
 
+export interface DetectedBarleySegment {
+  coordinates: Array<{ lat: number; lng: number }>;
+  confidence: number;
+  ndvi: number | null;
+  area_ha: number;
+}
+
 export interface AutomaticParcelAnalysis {
   is_barley?: boolean;
   barley_presence?: "confirmed" | "probable" | "none";
@@ -21,6 +28,7 @@ export interface AutomaticParcelAnalysis {
   gdd_detected?: boolean;
   gdd_daily_values?: Array<{ date: string; tmax: number; tmin: number; dj: number }>;
   gdd_error?: string | null;
+  detected_segments?: DetectedBarleySegment[];
 }
 
 export interface AutomaticParcel {
@@ -69,5 +77,21 @@ export async function searchAutomaticParcels(lat: number, lng: number, radiusKm:
 
 export function isAutomaticBarleyParcel(parcel: AutomaticParcel): boolean {
   const culture = parcel.analysis?.culture_detected?.toLowerCase() ?? "";
+  const confidence = parcel.analysis?.confidence;
+  if (typeof confidence === "number" && confidence < 70) return false;
   return parcel.analysis?.is_barley === true || (culture.includes("orge") && !culture.includes("non"));
+}
+
+export function getDetectedBarleySegments(parcel: AutomaticParcel): DetectedBarleySegment[] {
+  const segments = parcel.analysis?.detected_segments;
+  if (!Array.isArray(segments)) return [];
+
+  return segments.filter((segment): segment is DetectedBarleySegment => (
+    Array.isArray(segment.coordinates)
+    && segment.coordinates.length >= 3
+    && segment.coordinates.every((point) => Number.isFinite(point.lat) && Number.isFinite(point.lng))
+    && Number.isFinite(segment.confidence)
+    && segment.confidence >= 70
+    && Number.isFinite(segment.area_ha)
+  ));
 }

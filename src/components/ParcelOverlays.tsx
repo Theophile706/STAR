@@ -21,22 +21,26 @@ export default function ParcelOverlays({ map, parcelles }: ParcelOverlaysProps) 
       infoWindowRef.current = new google.maps.InfoWindow();
     }
 
-    parcelles.forEach((parcelle) => {
-      const path = parcelle.coordinates.map((c) => ({ lat: c.lat, lng: c.lng }));
+    parcelles
+      .filter((parcelle) => {
+        const detectedCulture = parcelle.culture_detected?.toLowerCase() ?? "";
+        return detectedCulture.includes("orge")
+          && !detectedCulture.includes("non")
+          && (parcelle.confidence == null || parcelle.confidence >= 70);
+      })
+      .forEach((parcelle) => {
+        const path = parcelle.coordinates.map((c) => ({ lat: c.lat, lng: c.lng }));
+        const color = "#fbbf24";
 
-      const detectedCulture = parcelle.culture_detected?.toLowerCase() ?? "";
-      const isBarley = detectedCulture.includes("orge") && !detectedCulture.includes("non");
-      const isConforme = parcelle.verdict?.toUpperCase().includes("CONFORME") && !parcelle.verdict?.toUpperCase().includes("NON");
-      const color = isBarley ? "#facc15" : isConforme ? "hsl(142, 60%, 45%)" : "hsl(0, 65%, 50%)";
-
-      const polygon = new google.maps.Polygon({
-        paths: path,
-        strokeColor: color,
-        strokeWeight: isBarley ? 3 : 2,
-        fillColor: color,
-        fillOpacity: isBarley ? 0.38 : 0.15,
-        map,
-      });
+        const polygon = new google.maps.Polygon({
+          paths: path,
+          strokeColor: color,
+          strokeWeight: 3,
+          fillColor: color,
+          fillOpacity: 0.12,
+          zIndex: 10,
+          map,
+        });
 
       polygon.addListener("mouseover", (e: google.maps.PolyMouseEvent) => {
         polygon.setOptions({ fillOpacity: 0.35 });
@@ -57,7 +61,7 @@ export default function ParcelOverlays({ map, parcelles }: ParcelOverlaysProps) 
       });
 
       polygon.addListener("mouseout", () => {
-        polygon.setOptions({ fillOpacity: isBarley ? 0.38 : 0.15 });
+        polygon.setOptions({ fillOpacity: 0.12 });
         infoWindowRef.current?.close();
       });
 

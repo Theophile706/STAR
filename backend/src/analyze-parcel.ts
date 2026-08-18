@@ -1,3 +1,7 @@
+import { setDefaultResultOrder } from "node:dns";
+
+setDefaultResultOrder("ipv4first");
+
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "content-type",
@@ -23,34 +27,67 @@ export async function analyzeParcel(req: Request): Promise<Response> {
       );
     }
 
+    const parcelPolygon = normalizePolygon(polygon);
+    if (!parcelPolygon) {
+      return new Response(
+        JSON.stringify({ error: "Le contour réel de la parcelle est requis (au moins 3 points valides)." }),
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
     const effectiveZoom = zoom || 16;
+    const warnings: string[] = [];
+    let projectId = "earthengine-legacy";
+    let accessToken: string | null = null;
     const serviceAccountJson = process.env.GEE_SERVICE_ACCOUNT_KEY;
+
     if (!serviceAccountJson || serviceAccountJson.startsWith("VOTRE_")) {
-      throw new Error("GEE_SERVICE_ACCOUNT_KEY n’est pas configurée.");
+      warnings.push("GEE_SERVICE_ACCOUNT_KEY n’est pas configurée.");
+    } else {
+      try {
+        const serviceAccount = JSON.parse(serviceAccountJson) as { project_id?: unknown };
+        if (typeof serviceAccount.project_id === "string" && serviceAccount.project_id.length > 0) {
+          projectId = serviceAccount.project_id;
+        }
+        accessToken = await getGeeAccessToken();
+      } catch (error) {
+        warnings.push(`GEE indisponible : ${error instanceof Error ? error.message : "authentification impossible"}`);
+      }
     }
 
-    let sa: { project_id?: string };
-    try {
-      sa = JSON.parse(serviceAccountJson);
-    } catch {
-      throw new Error("GEE_SERVICE_ACCOUNT_KEY doit contenir un JSON Google valide.");
-    }
-    const projectId = sa.project_id || "earthengine-legacy";
-    const accessToken = await getGeeAccessToken();
-
-    const [satData, timeSeries, satelliteImageBase64] = await Promise.all([
-      fetchCurrentSnapshot(accessToken, lat, lng, projectId),
-      fetchTimeSeries(accessToken, lat, lng, projectId),
-      captureParcelImage(lat, lng, effectiveZoom),
+    const [snapshotResult, timeSeriesResult] = await Promise.allSettled([
+      accessToken ? fetchCurrentSnapshot(accessToken, lat, lng, projectId, parcelPolygon) : Promise.resolve(null),
+      accessToken ? fetchTimeSeries(accessToken, lat, lng, projectId, parcelPolygon) : Promise.resolve(null),
     ]);
+    const satData = snapshotResult.status === "fulfilled" && snapshotResult.value
+      ? snapshotResult.value
+      : createEmptySatelliteData();
+    const timeSeries = timeSeriesResult.status === "fulfilled" && timeSeriesResult.value
+      ? timeSeriesResult.value
+      : { s2: [], s1: [] };
+    if (snapshotResult.status === "rejected") warnings.push(`Sentinel-2 indisponible : ${getErrorMessage(snapshotResult.reason)}`);
+    if (timeSeriesResult.status === "rejected") warnings.push(`Séries temporelles indisponibles : ${getErrorMessage(timeSeriesResult.reason)}`);
+
+    const detectedSegments = accessToken
+      ? await detectBarleySegments(accessToken, projectId, lat, lng, parcelPolygon, effectiveZoom, warnings)
+      : [];
+    if (!accessToken) warnings.push("SNIC non exécuté : authentification GEE indisponible.");
+
+    let satelliteImage: string | null = null;
+    try {
+      satelliteImage = await captureParcelImage(lat, lng, effectiveZoom, parcelPolygon);
+    } catch (error) {
+      warnings.push(`Google Static Maps indisponible : ${getErrorMessage(error)}`);
+    }
 
     const planting = detectPlantingDate(timeSeries.s2, timeSeries.s1);
     const agro = computeAgroScore(satData, planting, timeSeries);
-
-    const hfResult = await callHFModel(satelliteImageBase64);
-    const hybrid = computeHybridScore(hfResult.confidence, hfResult.is_barley, agro.score);
+    const hfResult = satelliteImage ? await callHFModelSafely(satelliteImage, warnings) : null;
+    const hybrid = hfResult
+      ? computeHybridScore(hfResult.confidence, hfResult.is_barley, agro.score)
+      : createUnavailableHybridScore();
     const season = detectSeason();
-    const dataSource = [...satData.dataSource, `HF OrgeDetector (${HF_MODEL_URL})`].join(" + ");
+    const dataSource = ["Contour parcellaire réel", ...satData.dataSource, ...(hfResult ? [`HF OrgeDetector (${HF_MODEL_URL})`] : [])].join(" + ");
     const spectralParts: string[] = [];
     if (satData.ndvi != null) spectralParts.push(`NDVI=${satData.ndvi}%`);
     if (satData.evi != null) spectralParts.push(`EVI=${satData.evi}%`);
@@ -68,17 +105,20 @@ export async function analyzeParcel(req: Request): Promise<Response> {
     if (satData.vhVvRatio != null && satData.vhVvRatio > 0.45) riskFactors.push("Structure radar type forêt");
     if (!hybrid.final_is_barley && hybrid.final_confidence > 70) riskFactors.push("Score hybride confirme non-orge");
     const detailParts: string[] = [];
-    detailParts.push(`CNN: ${hfResult.is_barley ? "orge" : "non-orge"} (${hfResult.confidence.toFixed(1)}%)`);
+    detailParts.push(hfResult
+      ? `CNN: ${hfResult.is_barley ? "orge" : "non-orge"} (${hfResult.confidence.toFixed(1)}%)`
+      : "CNN: indisponible");
     detailParts.push(`Agro: ${agro.score}%`);
     detailParts.push(`Hybride: ${hybrid.hybrid_score}%`);
 
     return new Response(JSON.stringify({
-      percentage: satData.ndvi, is_barley: hfResult.is_barley,
-      hf_model_url: HF_MODEL_URL, hf_available: true,
+      percentage: satData.ndvi, is_barley: hfResult?.is_barley === true,
+      detected_segments: detectedSegments,
+      hf_model_url: HF_MODEL_URL, hf_available: hfResult !== null,
       verdict: hybrid.final_verdict, details: detailParts.join(" | "),
-      culture_detected: hfResult.is_barley ? "Orge" : "Non-orge",
-      confidence: hfResult.confidence, cnn_prob_barley: hfResult.prob_barley,
-      cnn_prob_non_barley: hfResult.prob_non_barley, cnn_available: true,
+      culture_detected: hfResult ? (hfResult.is_barley ? "Orge" : "Non-orge") : null,
+      confidence: hfResult?.confidence ?? null, cnn_prob_barley: hfResult?.prob_barley ?? null,
+      cnn_prob_non_barley: hfResult?.prob_non_barley ?? null, cnn_available: hfResult !== null,
       evi: satData.evi, savi: satData.savi, ndwi: satData.ndwi,
       agro_score: agro.score, agro_breakdown: agro.breakdown, agro_details: agro.details,
       hybrid_score: hybrid.hybrid_score, saison: season,
@@ -86,10 +126,14 @@ export async function analyzeParcel(req: Request): Promise<Response> {
         ? (satData.swir / satData.nir > 1.5 ? "Sol argileux sec" : satData.swir / satData.nir > 1.0 ? "Sol limoneux" : "Sol humide")
         : null,
       risk_factors: riskFactors,
-      recommendations: hybrid.final_is_barley
+      boundary_source: "Contour fourni par l’utilisateur, le cadastre ou une source agricole fiable",
+      recommendations: hfResult && hybrid.final_is_barley
         ? `Orge ${hybrid.final_confidence > 70 ? "confirmée" : "probable"}. Score hybride ${hybrid.hybrid_score}% (CNN ${Math.round(hfResult.confidence)}% + Agro ${agro.score}%).`
-        : `Non-orge détecté. Score hybride ${hybrid.hybrid_score}%. Vérification terrain recommandée.`,
+        : hfResult
+          ? `Non-orge détecté. Score hybride ${hybrid.hybrid_score}%. Vérification terrain recommandée.`
+          : "Analyse partielle : le modèle de classification est indisponible.",
       anomaly_level: hybrid.final_is_barley ? "AUCUNE" : "FORTE", data_source: dataSource,
+      warnings,
       radar_analysis: radarAnalysis, spectral_analysis: spectralAnalysis,
       time_series_s2: timeSeries.s2, time_series_s1: timeSeries.s1,
       estimated_planting_date: planting.estimated_planting_date,
@@ -103,6 +147,382 @@ export async function analyzeParcel(req: Request): Promise<Response> {
       status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   }
+}
+
+type LatLng = { lat: number; lng: number };
+
+type DetectedSegment = {
+  coordinates: LatLng[];
+  confidence: number;
+  ndvi: number | null;
+  area_ha: number;
+};
+
+type SegmentCandidate = {
+  coordinates: LatLng[];
+  areaM2: number;
+  ndvi: number | null;
+};
+
+type GeeValue = {
+  constantValue?: unknown;
+  valueReference?: string;
+  functionInvocationValue?: {
+    functionName: string;
+    arguments: Record<string, GeeValue>;
+  };
+};
+
+const SNIC_PARAMETERS = {
+  size: 15,
+  compactness: 0.75,
+  connectivity: 8,
+  neighborhoodSize: 60,
+  scale: 10,
+} as const;
+const MIN_SEGMENT_AREA_M2 = 2_500;
+const MAX_SEGMENT_AREA_M2 = 500_000;
+const MAX_SEGMENTS_TO_CLASSIFY = 12;
+const MIN_BARLEY_CONFIDENCE = 70;
+const TIME_SERIES_CONCURRENCY = 1;
+const GEE_COMPUTE_TIMEOUT_MS = 60_000;
+const EXTERNAL_REQUEST_TIMEOUT_MS = 30_000;
+const RETRY_DELAYS_MS = [250, 1_000] as const;
+
+async function fetchWithRetry(input: string | URL, init: RequestInit, timeoutMs: number): Promise<Response> {
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
+    try {
+      const response = await fetch(input, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+      if (response.status < 500 && response.status !== 429) return response;
+      lastError = new Error(`HTTP ${response.status}`);
+    } catch (error) {
+      lastError = error;
+    }
+    const delay = RETRY_DELAYS_MS[attempt];
+    if (delay != null) await new Promise((resolve) => setTimeout(resolve, delay));
+  }
+  throw lastError instanceof Error ? lastError : new Error("Échec réseau après plusieurs tentatives.");
+}
+
+async function detectBarleySegments(
+  accessToken: string,
+  projectId: string,
+  lat: number,
+  lng: number,
+  polygon: unknown,
+  fallbackZoom: number,
+  warnings: string[],
+): Promise<DetectedSegment[]> {
+  try {
+    console.log("[SNIC] Segmentation démarrée");
+    const raw = await callGeeComputeRaw(accessToken, projectId, buildSNICVectorsExpression(lat, lng, polygon));
+    const result = raw.result;
+    if (!isGeeFeatureCollection(result)) {
+      console.warn("[SNIC] Aucune image Sentinel-2 exploitable ou aucun objet vectorisé.");
+      return [];
+    }
+
+    console.log("[SNIC] Image Sentinel-2 récupérée");
+    console.log("[SNIC] Prétraitement terminé");
+    console.log("[SNIC] Segmentation terminée");
+    console.log(`[SNIC] Nombre d'objets détectés : ${result.features.length}`);
+
+    const candidates = result.features
+      .flatMap(toSegmentCandidate)
+      .sort((left, right) => {
+        const vegetationDifference = (right.ndvi ?? -1) - (left.ndvi ?? -1);
+        return vegetationDifference !== 0 ? vegetationDifference : right.areaM2 - left.areaM2;
+      })
+      .slice(0, MAX_SEGMENTS_TO_CLASSIFY);
+
+    console.log(`[CLASSIFICATION] Objets envoyés au modèle : ${candidates.length}`);
+    const barleySegments: DetectedSegment[] = [];
+
+    for (const candidate of candidates) {
+      try {
+        const center = polygonCentroid(candidate.coordinates);
+        const thumbnail = await captureParcelImage(
+          center.lat,
+          center.lng,
+          segmentZoomForArea(candidate.areaM2, center.lat, fallbackZoom),
+          candidate.coordinates,
+        );
+        const classification = await callHFModel(thumbnail);
+        if (classification.is_barley && classification.confidence >= MIN_BARLEY_CONFIDENCE) {
+          barleySegments.push({
+            coordinates: candidate.coordinates,
+            confidence: Math.round(classification.confidence),
+            ndvi: candidate.ndvi,
+            area_ha: Math.round((candidate.areaM2 / 10_000) * 100) / 100,
+          });
+        }
+      } catch (error) {
+        console.warn("[CLASSIFICATION] Échec de la classification d'un objet :", error);
+      }
+    }
+
+    console.log(`[CLASSIFICATION] Orge détectée : ${barleySegments.length}`);
+    return barleySegments;
+  } catch (error) {
+    const message = getErrorMessage(error);
+    warnings.push(`SNIC indisponible : ${message}`);
+    console.warn("[SNIC] Échec de la segmentation :", error);
+    return [];
+  }
+}
+
+function isGeeFeatureCollection(value: unknown): value is { type: "FeatureCollection"; features: unknown[] } {
+  return !!value
+    && typeof value === "object"
+    && (value as { type?: unknown }).type === "FeatureCollection"
+    && Array.isArray((value as { features?: unknown }).features);
+}
+
+function toSegmentCandidate(feature: unknown): SegmentCandidate[] {
+  if (!feature || typeof feature !== "object") return [];
+  const value = feature as { geometry?: unknown; properties?: unknown };
+  const coordinates = extractLatLngFromGeometry(value.geometry);
+  if (coordinates.length < 3) return [];
+
+  const areaM2 = approximatePolygonAreaM2(coordinates);
+  if (areaM2 < MIN_SEGMENT_AREA_M2 || areaM2 > MAX_SEGMENT_AREA_M2) return [];
+
+  const properties = value.properties && typeof value.properties === "object"
+    ? value.properties as Record<string, unknown>
+    : {};
+  const ndvi = featureNumber(properties, ["NDVI", "NDVI_mean", "ndvi", "ndvi_mean"]);
+  const ndwi = featureNumber(properties, ["NDWI", "NDWI_mean", "ndwi", "ndwi_mean"]);
+  const ndbi = featureNumber(properties, ["NDBI", "NDBI_mean", "ndbi", "ndbi_mean"]);
+
+  if ((ndvi != null && ndvi < 0.2) || (ndwi != null && ndwi > 0.1) || (ndbi != null && ndbi > 0.05)) {
+    return [];
+  }
+
+  return [{ coordinates, areaM2, ndvi }];
+}
+
+function featureNumber(properties: Record<string, unknown>, names: string[]): number | null {
+  for (const name of names) {
+    const value = properties[name];
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+  }
+  return null;
+}
+
+function buildSNICVectorsExpression(_lat: number, _lng: number, polygon: unknown) {
+  const endDate = new Date().toISOString().slice(0, 10);
+  const startDate = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
+  const values: Record<string, GeeValue> = {};
+  const reference = (name: string): GeeValue => ({ valueReference: name });
+
+  values.region = geeCall("GeometryConstructors.Polygon", {
+    coordinates: geeConstant(polygonCoordinates(polygon)),
+  });
+  values.intersectsRegion = geeCall("Filter.intersects", {
+    leftField: geeConstant(".all"),
+    rightValue: geeCall("Feature", { geometry: reference("region") }),
+  });
+  values.dateRange = geeCall("Filter.dateRangeContains", {
+    leftValue: geeCall("DateRange", { start: geeConstant(startDate), end: geeConstant(endDate) }),
+    rightField: geeConstant("system:time_start"),
+  });
+  values.lowCloudCover = geeCall("Filter.lessThan", {
+    leftField: geeConstant("CLOUDY_PIXEL_PERCENTAGE"),
+    rightValue: geeConstant(35),
+  });
+  values.collectionByRegion = geeCall("Collection.filter", {
+    collection: geeCall("ImageCollection.load", { id: geeConstant("COPERNICUS/S2_SR_HARMONIZED") }),
+    filter: reference("intersectsRegion"),
+  });
+  values.collectionByDate = geeCall("Collection.filter", {
+    collection: reference("collectionByRegion"),
+    filter: reference("dateRange"),
+  });
+  values.collection = geeCall("Collection.filter", {
+    collection: reference("collectionByDate"),
+    filter: reference("lowCloudCover"),
+  });
+  values.composite = geeCall("reduce.median", { collection: reference("collection") });
+  values.spectralImage = geeCall("Image.select", {
+    input: reference("composite"),
+    bandSelectors: geeConstant(["B2", "B3", "B4", "B8", "B11", "B12"]),
+  });
+  values.withNdvi = addSpectralIndex(reference("spectralImage"), "NDVI", ["B8", "B4"]);
+  values.withNdwi = addSpectralIndex(reference("withNdvi"), "NDWI", ["B3", "B8"]);
+  values.withNdbi = addSpectralIndex(reference("withNdwi"), "NDBI", ["B11", "B8"]);
+  values.segmentationImage = addBareSoilIndex(reference("withNdbi"));
+
+  const imageBand = (name: string) => geeCall("Image.select", {
+    input: reference("segmentationImage"),
+    bandSelectors: geeConstant([name]),
+  });
+  values.ndviMask = geeCall("Image.gt", { image1: imageBand("NDVI"), image2: geeImageConstant(0.2) });
+  values.waterMask = geeCall("Image.lt", { image1: imageBand("NDWI"), image2: geeImageConstant(0.1) });
+  values.urbanMask = geeCall("Image.lt", { image1: imageBand("NDBI"), image2: geeImageConstant(0.05) });
+  values.bareSoilMask = geeCall("Image.lt", { image1: imageBand("BSI"), image2: geeImageConstant(0.2) });
+  values.vegetationMask = geeCall("Image.and", {
+    image1: geeCall("Image.and", {
+      image1: geeCall("Image.and", {
+        image1: reference("ndviMask"),
+        image2: reference("waterMask"),
+      }),
+      image2: reference("urbanMask"),
+    }),
+    image2: reference("bareSoilMask"),
+  });
+  values.maskedImage = geeCall("Image.updateMask", {
+    image: reference("segmentationImage"),
+    mask: reference("vegetationMask"),
+  });
+  values.vegetationImage = geeCall("Image.clip", {
+    input: reference("maskedImage"),
+    geometry: reference("region"),
+  });
+  values.snic = geeCall("Image.Segmentation.SNIC", {
+    image: reference("vegetationImage"),
+    size: geeConstant(SNIC_PARAMETERS.size),
+    compactness: geeConstant(SNIC_PARAMETERS.compactness),
+    connectivity: geeConstant(SNIC_PARAMETERS.connectivity),
+    neighborhoodSize: geeConstant(SNIC_PARAMETERS.neighborhoodSize),
+  });
+  values.snicClusters = geeCall("Image.select", {
+    input: reference("snic"),
+    bandSelectors: geeConstant(["clusters"]),
+  });
+  values.vectorsImage = geeCall("Image.addBands", {
+    dstImg: reference("snicClusters"),
+    srcImg: reference("vegetationImage"),
+  });
+  values.vectors = geeCall("Image.reduceToVectors", {
+    image: reference("vectorsImage"),
+    reducer: geeCall("Reducer.mean", {}),
+    geometry: reference("region"),
+    scale: geeConstant(SNIC_PARAMETERS.scale),
+    geometryType: geeConstant("polygon"),
+    eightConnected: geeConstant(true),
+    labelProperty: geeConstant("segment_id"),
+    bestEffort: geeConstant(true),
+    maxPixels: geeConstant(10_000_000),
+    tileScale: geeConstant(2),
+  });
+
+  return { expression: { result: "vectors", values } };
+}
+
+function addSpectralIndex(image: GeeValue, name: string, bands: [string, string]): GeeValue {
+  const index = geeCall("Image.rename", {
+    input: geeCall("Image.normalizedDifference", {
+      input: image,
+      bandNames: geeConstant(bands),
+    }),
+    names: geeConstant([name]),
+  });
+  return geeCall("Image.addBands", { dstImg: image, srcImg: index });
+}
+
+function addBareSoilIndex(image: GeeValue): GeeValue {
+  const band = (name: string) => geeCall("Image.select", {
+    input: image,
+    bandSelectors: geeConstant([name]),
+  });
+  const swirPlusRed = geeCall("Image.add", { image1: band("B11"), image2: band("B4") });
+  const nirPlusBlue = geeCall("Image.add", { image1: band("B8"), image2: band("B2") });
+  const bsi = geeCall("Image.divide", {
+    image1: geeCall("Image.subtract", { image1: swirPlusRed, image2: nirPlusBlue }),
+    image2: geeCall("Image.add", { image1: swirPlusRed, image2: nirPlusBlue }),
+  });
+  return geeCall("Image.addBands", {
+    dstImg: image,
+    srcImg: geeCall("Image.rename", { input: bsi, names: geeConstant(["BSI"]) }),
+  });
+}
+
+function geeCall(functionName: string, arguments_: Record<string, GeeValue>): GeeValue {
+  return { functionInvocationValue: { functionName, arguments: arguments_ } };
+}
+
+function geeConstant(value: unknown): GeeValue {
+  return { constantValue: value };
+}
+
+function geeImageConstant(value: number): GeeValue {
+  return geeCall("Image.constant", { value: geeConstant(value) });
+}
+
+function normalizePolygon(value: unknown): LatLng[] | null {
+  if (!Array.isArray(value)) return null;
+  const points = value.flatMap((point): LatLng[] => {
+    if (!point || typeof point !== "object") return [];
+    const coordinates = point as { lat?: unknown; lng?: unknown };
+    return typeof coordinates.lat === "number"
+      && Number.isFinite(coordinates.lat)
+      && coordinates.lat >= -90
+      && coordinates.lat <= 90
+      && typeof coordinates.lng === "number"
+      && Number.isFinite(coordinates.lng)
+      && coordinates.lng >= -180
+      && coordinates.lng <= 180
+      ? [{ lat: coordinates.lat, lng: coordinates.lng }]
+      : [];
+  });
+  if (points.length < 3) return null;
+  const first = points[0];
+  const last = points.at(-1);
+  return last && first.lat === last.lat && first.lng === last.lng ? points.slice(0, -1) : points;
+}
+
+function polygonCoordinates(polygon: unknown): number[][][] {
+  const points = normalizePolygon(polygon);
+  if (!points) throw new Error("Le contour de la parcelle est invalide.");
+  const ring = points.map((point) => [point.lng, point.lat]);
+  ring.push([...ring[0]]);
+  return [ring];
+}
+
+function extractLatLngFromGeometry(geometry: unknown): LatLng[] {
+  if (!geometry || typeof geometry !== "object") return [];
+  const value = geometry as { type?: unknown; coordinates?: unknown };
+  const ring = value.type === "Polygon" && Array.isArray(value.coordinates)
+    ? value.coordinates[0]
+    : value.type === "MultiPolygon" && Array.isArray(value.coordinates)
+      ? value.coordinates[0]?.[0]
+      : null;
+  if (!Array.isArray(ring)) return [];
+
+  return ring.flatMap((coordinate): LatLng[] => Array.isArray(coordinate)
+    && typeof coordinate[0] === "number"
+    && typeof coordinate[1] === "number"
+    ? [{ lat: coordinate[1], lng: coordinate[0] }]
+    : []);
+}
+
+function approximatePolygonAreaM2(coords: LatLng[]): number {
+  if (coords.length < 3) return 0;
+  const centroid = polygonCentroid(coords);
+  const latFactor = 111_320;
+  const lngFactor = 111_320 * Math.cos((centroid.lat * Math.PI) / 180);
+  const points = coords.map((point) => ({
+    x: (point.lng - centroid.lng) * lngFactor,
+    y: (point.lat - centroid.lat) * latFactor,
+  }));
+  let area = 0;
+  for (let index = 0; index < points.length; index++) {
+    const next = (index + 1) % points.length;
+    area += points[index].x * points[next].y - points[next].x * points[index].y;
+  }
+  return Math.abs(area) / 2;
+}
+
+function polygonCentroid(coords: LatLng[]): LatLng {
+  const total = coords.reduce((sum, point) => ({ lat: sum.lat + point.lat, lng: sum.lng + point.lng }), { lat: 0, lng: 0 });
+  return { lat: total.lat / coords.length, lng: total.lng / coords.length };
+}
+
+function segmentZoomForArea(areaM2: number, latitude: number, fallbackZoom: number): number {
+  const targetWidthM = Math.max(180, Math.sqrt(areaM2) * 2.2);
+  const zoom = Math.floor(Math.log2((156_543.03392 * Math.cos(latitude * Math.PI / 180) * 640) / targetWidthM));
+  return Math.max(fallbackZoom, Math.min(20, zoom));
 }
 
 async function getGeeAccessToken(): Promise<string> {
@@ -144,11 +564,11 @@ async function getGeeAccessToken(): Promise<string> {
 
   const jwt = `${unsignedToken}.${sig}`;
 
-  const tokenResp = await fetch("https://oauth2.googleapis.com/token", {
+  const tokenResp = await fetchWithRetry("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${jwt}`,
-  });
+  }, EXTERNAL_REQUEST_TIMEOUT_MS);
 
   if (!tokenResp.ok) {
     const err = await tokenResp.text();
@@ -161,15 +581,15 @@ async function getGeeAccessToken(): Promise<string> {
 
 // ── GEE Expression Builders ──
 
-function buildS2Expression(lat: number, lng: number, startDate: string, endDate: string) {
+function buildS2Expression(lat: number, lng: number, startDate: string, endDate: string, polygon: unknown) {
   return {
     expression: {
       result: "0",
       values: {
         "1": {
           functionInvocationValue: {
-            functionName: "GeometryConstructors.Point",
-            arguments: { coordinates: { constantValue: [lng, lat] } },
+            functionName: "GeometryConstructors.Polygon",
+            arguments: { coordinates: { constantValue: polygonCoordinates(polygon) } },
           },
         },
         "0": {
@@ -263,15 +683,15 @@ function buildS2Expression(lat: number, lng: number, startDate: string, endDate:
   };
 }
 
-function buildS1Expression(lat: number, lng: number, startDate: string, endDate: string) {
+function buildS1Expression(lat: number, lng: number, startDate: string, endDate: string, polygon: unknown) {
   return {
     expression: {
       result: "0",
       values: {
         "1": {
           functionInvocationValue: {
-            functionName: "GeometryConstructors.Point",
-            arguments: { coordinates: { constantValue: [lng, lat] } },
+            functionName: "GeometryConstructors.Polygon",
+            arguments: { coordinates: { constantValue: polygonCoordinates(polygon) } },
           },
         },
         "0": {
@@ -370,11 +790,11 @@ function buildS1Expression(lat: number, lng: number, startDate: string, endDate:
 async function callGeeCompute(accessToken: string, projectId: string, expression: unknown): Promise<Record<string, number | null> | null> {
   const url = `https://earthengine.googleapis.com/v1/projects/${projectId}/value:compute`;
   try {
-    const resp = await fetch(url, {
+    const resp = await fetchWithRetry(url, {
       method: "POST",
       headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
       body: JSON.stringify(expression),
-    });
+    }, GEE_COMPUTE_TIMEOUT_MS);
     if (!resp.ok) {
       const errText = await resp.text().catch(() => "");
       console.error("GEE API error:", resp.status, errText.slice(0, 300));
@@ -386,6 +806,24 @@ async function callGeeCompute(accessToken: string, projectId: string, expression
     console.error("GEE fetch error:", e);
     return null;
   }
+}
+
+// Variant that returns the raw compute response (useful for vector outputs)
+async function callGeeComputeRaw(accessToken: string, projectId: string, expression: unknown): Promise<Record<string, unknown>> {
+  const url = `https://earthengine.googleapis.com/v1/projects/${projectId}/value:compute`;
+  const resp = await fetchWithRetry(url, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify(expression),
+  }, GEE_COMPUTE_TIMEOUT_MS);
+  if (!resp.ok) {
+    const errText = await resp.text().catch(() => "");
+    console.error("GEE API error (raw):", resp.status, errText.slice(0, 300));
+    throw new Error(`Erreur GEE lors de la segmentation (${resp.status}).`);
+  }
+  const data: unknown = await resp.json();
+  if (!data || typeof data !== "object") throw new Error("Réponse GEE de segmentation invalide.");
+  return data as Record<string, unknown>;
 }
 
 // ── Satellite data types ──
@@ -411,6 +849,25 @@ interface SatelliteData {
   vh: number | null;
   vhVvRatio: number | null;
   dataSource: string[];
+}
+
+function createEmptySatelliteData(): SatelliteData {
+  return {
+    ndvi: null, ndwi: null, evi: null, savi: null,
+    blue: null, nir: null, red: null, green: null, swir: null,
+    vv: null, vh: null, vhVvRatio: null, dataSource: [],
+  };
+}
+
+function getErrorMessage(error: unknown): string {
+  if (!(error instanceof Error)) return "erreur réseau inconnue";
+  const cause = error.cause;
+  if (cause && typeof cause === "object") {
+    const details = cause as { code?: unknown; message?: unknown };
+    if (typeof details.code === "string") return `${error.message} (${details.code})`;
+    if (typeof details.message === "string") return `${error.message} (${details.message})`;
+  }
+  return error.message;
 }
 
 function parseS2Bands(result: Record<string, number | null>) {
@@ -464,14 +921,14 @@ function computeSpectralIndices(nir: number | null, red: number | null, blue: nu
   return { ndvi, ndwi, evi, savi };
 }
 
-async function fetchCurrentSnapshot(accessToken: string, lat: number, lng: number, projectId: string): Promise<SatelliteData> {
+async function fetchCurrentSnapshot(accessToken: string, lat: number, lng: number, projectId: string, polygon: unknown): Promise<SatelliteData> {
   const now = new Date();
   const end = now.toISOString().slice(0, 10);
   const start = new Date(now.getTime() - 180 * 86400000).toISOString().slice(0, 10);
 
   const [s2Result, s1Result] = await Promise.all([
-    callGeeCompute(accessToken, projectId, buildS2Expression(lat, lng, start, end)),
-    callGeeCompute(accessToken, projectId, buildS1Expression(lat, lng, start, end)),
+    callGeeCompute(accessToken, projectId, buildS2Expression(lat, lng, start, end, polygon)),
+    callGeeCompute(accessToken, projectId, buildS1Expression(lat, lng, start, end, polygon)),
   ]);
 
   const result: SatelliteData = {
@@ -529,12 +986,12 @@ function getMonthlyRanges(numMonths: number): Array<{ label: string; start: stri
 }
 
 async function fetchTimeSeries(
-  accessToken: string, lat: number, lng: number, projectId: string
+  accessToken: string, lat: number, lng: number, projectId: string, polygon: unknown
 ): Promise<{ s2: TimeSeriesPointS2[]; s1: TimeSeriesPointS1[] }> {
   const months = getMonthlyRanges(6);
 
-  const s2Promises = months.map(async (m) => {
-    const result = await callGeeCompute(accessToken, projectId, buildS2Expression(lat, lng, m.start, m.end));
+  const s2 = await mapWithConcurrency(months, TIME_SERIES_CONCURRENCY, async (m) => {
+    const result = await callGeeCompute(accessToken, projectId, buildS2Expression(lat, lng, m.start, m.end, polygon));
     let ndvi: number | null = null;
     if (result) {
       const { nir, red } = parseS2Bands(result);
@@ -545,8 +1002,8 @@ async function fetchTimeSeries(
     return { date: m.label, ndvi, cloud_cover: null } as TimeSeriesPointS2;
   });
 
-  const s1Promises = months.map(async (m) => {
-    const result = await callGeeCompute(accessToken, projectId, buildS1Expression(lat, lng, m.start, m.end));
+  const s1 = await mapWithConcurrency(months, TIME_SERIES_CONCURRENCY, async (m) => {
+    const result = await callGeeCompute(accessToken, projectId, buildS1Expression(lat, lng, m.start, m.end, polygon));
     let vv: number | null = null;
     let vh: number | null = null;
     if (result) {
@@ -557,8 +1014,22 @@ async function fetchTimeSeries(
     return { date: m.label, vv, vh } as TimeSeriesPointS1;
   });
 
-  const [s2, s1] = await Promise.all([Promise.all(s2Promises), Promise.all(s1Promises)]);
   return { s2, s1 };
+}
+
+async function mapWithConcurrency<T, R>(items: T[], concurrency: number, mapper: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = [];
+  let cursor = 0;
+
+  async function worker() {
+    while (cursor < items.length) {
+      const index = cursor++;
+      results[index] = await mapper(items[index]);
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
+  return results;
 }
 
 // ── Planting Date Detection ──
@@ -804,13 +1275,25 @@ function computeHybridScore(cnnConfidence: number, cnnIsBarley: boolean, agroSco
 
 // ── HuggingFace Model Integration ──
 
-async function captureParcelImage(lat: number, lng: number, zoom: number): Promise<string> {
+async function captureParcelImage(lat: number, lng: number, zoom: number, polygon?: unknown): Promise<string> {
   if (!GOOGLE_MAPS_API_KEY || GOOGLE_MAPS_API_KEY.startsWith("VOTRE_")) {
     throw new Error("GOOGLE_MAPS_API_KEY n’est pas configurée.");
   }
-  const staticUrl = `https://maps.googleapis.com/maps/api/staticmap?center=${lat},${lng}&zoom=${zoom}&size=640x640&maptype=satellite&key=${GOOGLE_MAPS_API_KEY}`;
 
-  const resp = await fetch(staticUrl);
+  const params = new URLSearchParams({
+    center: `${lat},${lng}`,
+    zoom: String(zoom),
+    size: "640x640",
+    maptype: "satellite",
+    key: GOOGLE_MAPS_API_KEY,
+  });
+  const parcelPolygon = normalizePolygon(polygon);
+  if (parcelPolygon) {
+    const path = parcelPolygon.map((point) => `${point.lat},${point.lng}`).join("|");
+    params.set("path", `color:0xfbbf24ff|weight:2|${path}`);
+  }
+
+  const resp = await fetchWithRetry(`https://maps.googleapis.com/maps/api/staticmap?${params.toString()}`, {}, EXTERNAL_REQUEST_TIMEOUT_MS);
   if (!resp.ok) {
     throw new Error(`Google Maps Static API error: ${resp.status}`);
   }
@@ -831,6 +1314,26 @@ interface HFModelResult {
   prob_non_barley: number;
 }
 
+async function callHFModelSafely(imageBase64: string, warnings: string[]): Promise<HFModelResult | null> {
+  try {
+    return await callHFModel(imageBase64);
+  } catch (error) {
+    const message = getErrorMessage(error);
+    warnings.push(`Modèle Hugging Face indisponible : ${message}`);
+    console.warn("[CLASSIFICATION] Modèle indisponible :", error);
+    return null;
+  }
+}
+
+function createUnavailableHybridScore(): ReturnType<typeof computeHybridScore> {
+  return {
+    hybrid_score: 0,
+    final_is_barley: false,
+    final_verdict: "⚠️ ANALYSE PARTIELLE — Modèle de classification indisponible",
+    final_confidence: 0,
+  };
+}
+
 async function callHFModel(satelliteImageBase64: string): Promise<HFModelResult> {
   console.log("Calling HF model /predict at:", HF_MODEL_URL);
 
@@ -844,10 +1347,10 @@ async function callHFModel(satelliteImageBase64: string): Promise<HFModelResult>
   const blob = new Blob([bytes], { type: "image/png" });
   formData.append("file", blob, "parcel.png");
 
-  const resp = await fetch(`${HF_MODEL_URL}/predict`, {
+  const resp = await fetchWithRetry(`${HF_MODEL_URL}/predict`, {
     method: "POST",
     body: formData,
-  });
+  }, EXTERNAL_REQUEST_TIMEOUT_MS);
 
   if (!resp.ok) {
     const errText = await resp.text().catch(() => "");
