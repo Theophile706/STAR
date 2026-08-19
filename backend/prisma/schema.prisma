@@ -17,6 +17,8 @@ model Parcelle {
   culture_declared         String?
   culture_detected         String?
   ndvi_percentage          Float?
+  ndre                     Float?
+  spectral_bands           Json?
   confidence               Float?
   verdict                  String?
   details                  String?

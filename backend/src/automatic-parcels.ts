@@ -1,4 +1,27 @@
 import { analyzeParcel } from "./analyze-parcel.js";
+import {
+  addBareSoilIndex,
+  addSpectralIndex,
+  approximatePolygonAreaM2,
+  callGeeComputeRaw,
+  extractLatLngFromGeometry,
+  fetchWithRetry,
+  geeCall,
+  geeConstant,
+  geeImageConstant,
+  GEE_COMPUTE_TIMEOUT_MS,
+  getGeeAccessToken,
+  isGeeFeatureCollection,
+  type GeeValue,
+} from "./analyze-parcel.js";
+import {
+  lngLatToMercatorMeters,
+  mercatorMetersToLngLat,
+  parseNpyFloat32,
+  simplifyPolygon,
+  traceLabelContours,
+  watershedSegment,
+} from "./field-watershed.js";
 import { Prisma, PrismaClient } from "@prisma/client";
 
 export interface BarleyDetectionConfig {
@@ -47,17 +70,312 @@ const OVERPASS_USER_AGENT = process.env.OVERPASS_USER_AGENT ?? "fieldscan-ai/1.0
 const MAX_CANDIDATES = 48;
 const MAX_SATELLITE_CELLS = 36;
 const ANALYSIS_CONCURRENCY = 2;
-const AUTOMATIC_SEGMENT_LABEL_PREFIX = "automatic-orge-segment:";
 const prisma = new PrismaClient();
 
-// ── Segmentation automatique des limites de parcelles (image satellite) ──
+// ── Segmentation par watershed marqué + variance NDVI multi-temporelle (sans ML) ──
+// Approche la plus fiable des trois : suit les vrais gradients NDVI (comme un
+// vrai contour de champ) au lieu de regrouper des pixels similaires (SNIC),
+// et exploite la différence de calendrier cultural entre parcelles voisines
+// (variance temporelle) pour distinguer deux champs qui se ressemblent à un
+// instant T. Voir src/field-watershed.ts pour l'algorithme (priority-flood).
+const WATERSHED_RASTER_SCALE_M = 10; // résolution Sentinel-2
+const MAX_WATERSHED_RADIUS_KM = 1.5; // borne la taille du raster (perf + limites computePixels)
+const WATERSHED_SEASON_DAYS = 120;
+const WATERSHED_TEMPORAL_PERIODS = 4;
+const WATERSHED_MIN_SEGMENT_AREA_M2 = 1_000;   // 0.1 ha
+const WATERSHED_MAX_SEGMENT_AREA_M2 = 800_000; // 80 ha
+const WATERSHED_SIMPLIFY_EPS_PX = 1.2;
+
+// ── Watershed marqué + variance NDVI multi-temporelle ──
+
+async function callGeeComputePixels(
+  accessToken: string,
+  projectId: string,
+  expression: { result: string; values: Record<string, GeeValue> },
+  bandId: string,
+  grid: { widthPx: number; heightPx: number; originXMeters: number; originYMeters: number; scaleMeters: number },
+): Promise<{ data: Float32Array; width: number; height: number }> {
+  const url = `https://earthengine.googleapis.com/v1/projects/${projectId}/image:computePixels`;
+  const body = {
+    expression,
+    fileFormat: "NPY",
+    bandIds: [bandId],
+    grid: {
+      dimensions: { width: grid.widthPx, height: grid.heightPx },
+      affineTransform: {
+        scaleX: grid.scaleMeters,
+        shearX: 0,
+        translateX: grid.originXMeters,
+        shearY: 0,
+        scaleY: -grid.scaleMeters,
+        translateY: grid.originYMeters,
+      },
+      crsCode: "EPSG:3857",
+    },
+  };
+  const response = await fetchWithRetry(url, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }, GEE_COMPUTE_TIMEOUT_MS);
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`GEE computePixels (${bandId}) : erreur ${response.status} ${text.slice(0, 300)}`);
+  }
+  const arrayBuffer = await response.arrayBuffer();
+  const { data, shape } = parseNpyFloat32(arrayBuffer);
+  const [height, width] = shape;
+  return { data, width, height };
+}
+
+/**
+ * Construit l'image 2 bandes ("grad", "tstd") utilisée comme carte de "force
+ * de frontière" pour le watershed :
+ *  - grad : magnitude du gradient spatial du NDVI médian saisonnier
+ *  - tstd : écart-type du NDVI entre WATERSHED_TEMPORAL_PERIODS sous-périodes
+ * Les deux bandes valent WATERSHED_BARRIER_VALUE hors du masque "surface
+ * agricole plausible" (végétatif, non-eau, non-bâti, non-sol-nu), ce qui les
+ * transforme en barrières infranchissables pour le watershed.
+ */
+const WATERSHED_BARRIER_VALUE = 1_000_000;
+
+function buildBoundaryStrengthExpression(lat: number, lng: number, radiusKm: number) {
+  const endDate = new Date();
+  const seasonStart = new Date(endDate.getTime() - WATERSHED_SEASON_DAYS * 86_400_000);
+  const values: Record<string, GeeValue> = {};
+  const reference = (name: string): GeeValue => ({ valueReference: name });
+
+  values.region = geeCall("GeometryConstructors.Polygon", {
+    coordinates: geeConstant(circleRegionCoordinates(lat, lng, radiusKm)),
+  });
+  values.intersectsRegion = geeCall("Filter.intersects", {
+    leftField: geeConstant(".all"),
+    rightValue: geeCall("Feature", { geometry: reference("region") }),
+  });
+  values.collectionByRegion = geeCall("Collection.filter", {
+    collection: geeCall("ImageCollection.load", { id: geeConstant("COPERNICUS/S2_SR_HARMONIZED") }),
+    filter: reference("intersectsRegion"),
+  });
+
+  // Composite NDVI de toute la saison, pour le gradient spatial + le masque cropland.
+  const buildPeriodNdvi = (varPrefix: string, startDate: string, endDate: string, cloudLimit: number) => {
+    values[`${varPrefix}DateRange`] = geeCall("Filter.dateRangeContains", {
+      leftValue: geeCall("DateRange", { start: geeConstant(startDate), end: geeConstant(endDate) }),
+      rightField: geeConstant("system:time_start"),
+    });
+    values[`${varPrefix}ByDate`] = geeCall("Collection.filter", {
+      collection: reference("collectionByRegion"),
+      filter: reference(`${varPrefix}DateRange`),
+    });
+    values[`${varPrefix}LowCloud`] = geeCall("Filter.lessThan", {
+      leftField: geeConstant("CLOUDY_PIXEL_PERCENTAGE"),
+      rightValue: geeConstant(cloudLimit),
+    });
+    values[`${varPrefix}Collection`] = geeCall("Collection.filter", {
+      collection: reference(`${varPrefix}ByDate`),
+      filter: reference(`${varPrefix}LowCloud`),
+    });
+    values[`${varPrefix}Composite`] = geeCall("reduce.median", { collection: reference(`${varPrefix}Collection`) });
+    values[`${varPrefix}Spectral`] = geeCall("Image.select", {
+      input: reference(`${varPrefix}Composite`),
+      bandSelectors: geeConstant(["B2", "B3", "B4", "B8", "B11", "B12"]),
+    });
+    values[`${varPrefix}WithNdvi`] = addSpectralIndex(reference(`${varPrefix}Spectral`), "NDVI", ["B8", "B4"]);
+    values[`${varPrefix}NdviBand`] = geeCall("Image.select", {
+      input: reference(`${varPrefix}WithNdvi`),
+      bandSelectors: geeConstant(["NDVI"]),
+    });
+    return `${varPrefix}NdviBand`;
+  };
+
+  const seasonNdviRef = buildPeriodNdvi("season", seasonStart.toISOString().slice(0, 10), endDate.toISOString().slice(0, 10), 35);
+
+  // Bandes de masquage cropland, calculées sur le composite saisonnier complet (NDWI/NDBI/BSI).
+  values.seasonWithNdwi = addSpectralIndex(reference("seasonWithNdvi"), "NDWI", ["B3", "B8"]);
+  values.seasonWithNdbi = addSpectralIndex(reference("seasonWithNdwi"), "NDBI", ["B11", "B8"]);
+  values.seasonWithBsi = addBareSoilIndex(reference("seasonWithNdbi"));
+  const seasonBand = (name: string) => geeCall("Image.select", {
+    input: reference("seasonWithBsi"),
+    bandSelectors: geeConstant([name]),
+  });
+  values.ndviMask = geeCall("Image.gt", { image1: seasonBand("NDVI"), image2: geeImageConstant(0.15) });
+  values.waterMask = geeCall("Image.lt", { image1: seasonBand("NDWI"), image2: geeImageConstant(0.1) });
+  values.urbanMask = geeCall("Image.lt", { image1: seasonBand("NDBI"), image2: geeImageConstant(0.05) });
+  values.bareSoilMask = geeCall("Image.lt", { image1: seasonBand("BSI"), image2: geeImageConstant(0.25) });
+  values.fieldMask = geeCall("Image.and", {
+    image1: geeCall("Image.and", {
+      image1: geeCall("Image.and", { image1: reference("ndviMask"), image2: reference("waterMask") }),
+      image2: reference("urbanMask"),
+    }),
+    image2: reference("bareSoilMask"),
+  });
+
+  // Gradient spatial du NDVI saisonnier -> magnitude.
+  values.ndviGradient = geeCall("Image.gradient", { input: reference(seasonNdviRef) });
+  values.gradX = geeCall("Image.select", { input: reference("ndviGradient"), bandSelectors: geeConstant(["x"]) });
+  values.gradY = geeCall("Image.select", { input: reference("ndviGradient"), bandSelectors: geeConstant(["y"]) });
+  values.gradMagnitude = geeCall("Image.hypot", { image1: reference("gradX"), image2: reference("gradY") });
+
+  // NDVI sur WATERSHED_TEMPORAL_PERIODS sous-périodes -> écart-type temporel.
+  const periodMs = (WATERSHED_SEASON_DAYS * 86_400_000) / WATERSHED_TEMPORAL_PERIODS;
+  let stackRef: string | null = null;
+  for (let i = 0; i < WATERSHED_TEMPORAL_PERIODS; i++) {
+    const periodStart = new Date(seasonStart.getTime() + i * periodMs);
+    const periodEnd = new Date(seasonStart.getTime() + (i + 1) * periodMs);
+    const ndviRef = buildPeriodNdvi(`p${i}`, periodStart.toISOString().slice(0, 10), periodEnd.toISOString().slice(0, 10), 50);
+    const renamedRef = `p${i}NdviRenamed`;
+    values[renamedRef] = geeCall("Image.rename", { input: reference(ndviRef), names: geeConstant([`ndvi_${i}`]) });
+    stackRef = stackRef === null
+      ? renamedRef
+      : (() => {
+        const combinedRef = `tempStack${i}`;
+        values[combinedRef] = geeCall("Image.addBands", { dstImg: reference(stackRef as string), srcImg: reference(renamedRef) });
+        return combinedRef;
+      })();
+  }
+  values.temporalStdDev = geeCall("Image.reduce", {
+    image: reference(stackRef as string),
+    reducer: geeCall("Reducer.stdDev", {}),
+  });
+
+  // Application du masque cropland comme barrière (valeur très haute hors zone agricole).
+  const applyBarrier = (imageRef: string, outName: string) => {
+    const maskedRef = `${outName}Masked`;
+    const unmaskedRef = `${outName}Barrier`;
+    values[maskedRef] = geeCall("Image.updateMask", { image: reference(imageRef), mask: reference("fieldMask") });
+    values[unmaskedRef] = geeCall("Image.unmask", { input: reference(maskedRef), value: geeImageConstant(WATERSHED_BARRIER_VALUE) });
+    return unmaskedRef;
+  };
+  const gradBarrierRef = applyBarrier("gradMagnitude", "grad");
+  const tstdBarrierRef = applyBarrier("temporalStdDev", "tstd");
+
+  values.gradFloat = geeCall("Image.rename", { input: geeCall("Image.toFloat", { input: reference(gradBarrierRef) }), names: geeConstant(["grad"]) });
+  values.tstdFloat = geeCall("Image.rename", { input: geeCall("Image.toFloat", { input: reference(tstdBarrierRef) }), names: geeConstant(["tstd"]) });
+  values.finalImage = geeCall("Image.clip", {
+    input: geeCall("Image.addBands", { dstImg: reference("gradFloat"), srcImg: reference("tstdFloat") }),
+    geometry: reference("region"),
+  });
+
+  return { result: "finalImage", values };
+}
+
+async function discoverAgriculturalParcelsFromWatershed(
+  lat: number,
+  lng: number,
+  radiusKm: number,
+): Promise<CandidateParcel[]> {
+  const serviceAccountJson = process.env.GEE_SERVICE_ACCOUNT_KEY;
+  if (!serviceAccountJson || serviceAccountJson.startsWith("VOTRE_")) return [];
+  if (radiusKm > MAX_WATERSHED_RADIUS_KM) return [];
+
+  const accessToken = await getGeeAccessToken();
+  const projectId = getGeeProjectId();
+  const expression = buildBoundaryStrengthExpression(lat, lng, radiusKm);
+
+  const center = lngLatToMercatorMeters(lng, lat);
+  const radiusMeters = radiusKm * 1000 * 1.05; // légère marge
+  const widthPx = Math.min(400, Math.ceil((2 * radiusMeters) / WATERSHED_RASTER_SCALE_M));
+  const heightPx = widthPx;
+  const grid = {
+    widthPx,
+    heightPx,
+    originXMeters: center.x - radiusMeters,
+    originYMeters: center.y + radiusMeters, // origine = coin haut-gauche (Y décroît vers le bas)
+    scaleMeters: WATERSHED_RASTER_SCALE_M,
+  };
+
+  const [gradRaster, tstdRaster] = await Promise.all([
+    callGeeComputePixels(accessToken, projectId, expression, "grad", grid),
+    callGeeComputePixels(accessToken, projectId, expression, "tstd", grid),
+  ]);
+  const { width, height } = gradRaster;
+  const size = width * height;
+
+  // Normalisation min-max (hors barrière) + fusion des deux signaux de frontière.
+  const barrier = new Uint8Array(size);
+  let gradMin = Infinity, gradMax = -Infinity, tstdMin = Infinity, tstdMax = -Infinity;
+  for (let i = 0; i < size; i++) {
+    const isBarrier = gradRaster.data[i] >= WATERSHED_BARRIER_VALUE || tstdRaster.data[i] >= WATERSHED_BARRIER_VALUE;
+    barrier[i] = isBarrier ? 1 : 0;
+    if (!isBarrier) {
+      if (gradRaster.data[i] < gradMin) gradMin = gradRaster.data[i];
+      if (gradRaster.data[i] > gradMax) gradMax = gradRaster.data[i];
+      if (tstdRaster.data[i] < tstdMin) tstdMin = tstdRaster.data[i];
+      if (tstdRaster.data[i] > tstdMax) tstdMax = tstdRaster.data[i];
+    }
+  }
+  if (!Number.isFinite(gradMin) || !Number.isFinite(tstdMin)) return []; // rien d'exploitable (tout barrière)
+
+  const strength = new Float32Array(size);
+  const gradRange = Math.max(gradMax - gradMin, 1e-9);
+  const tstdRange = Math.max(tstdMax - tstdMin, 1e-9);
+  for (let i = 0; i < size; i++) {
+    if (barrier[i]) {
+      strength[i] = WATERSHED_BARRIER_VALUE;
+      continue;
+    }
+    const normGrad = (gradRaster.data[i] - gradMin) / gradRange;
+    const normTstd = (tstdRaster.data[i] - tstdMin) / tstdRange;
+    strength[i] = 0.6 * normGrad + 0.4 * normTstd;
+  }
+
+  const labels = watershedSegment(strength, barrier, width, height);
+  const contours = traceLabelContours(labels, width, height);
+
+  const candidates: CandidateParcel[] = [];
+  let index = 0;
+  for (const pixelContour of contours.values()) {
+    const simplified = simplifyPolygon(pixelContour, WATERSHED_SIMPLIFY_EPS_PX);
+    if (simplified.length < 3) continue;
+
+    const coordinates = simplified.map((point: { x: number; y: number }) => {
+      const xMeters = grid.originXMeters + point.x * grid.scaleMeters;
+      const yMeters = grid.originYMeters - point.y * grid.scaleMeters;
+      const { lng: pointLng, lat: pointLat } = mercatorMetersToLngLat(xMeters, yMeters);
+      return { lat: pointLat, lng: pointLng };
+    });
+
+    const areaM2 = approximatePolygonAreaM2(coordinates);
+    if (areaM2 < WATERSHED_MIN_SEGMENT_AREA_M2 || areaM2 > WATERSHED_MAX_SEGMENT_AREA_M2) continue;
+
+    index++;
+    candidates.push({
+      id: `gee-watershed-${lat.toFixed(6)}-${lng.toFixed(6)}-${index}`,
+      coordinates,
+      center: polygonCenter(coordinates),
+      tags: { source: "gee-watershed-segmentation" },
+    });
+  }
+
+  return candidates;
+}
+
+// ── Segmentation automatique des limites de parcelles (SNIC via Google Earth Engine) ──
+// Aucun modèle ML : SNIC (Simple Non-Iterative Clustering) est un algorithme de
+// segmentation classique par superpixels, appliqué ici à une image Sentinel-2
+// (NDVI/NDWI/NDBI/BSI) sur une région circulaire autour du point demandé.
+// C'est le même algorithme que celui déjà utilisé par analyze-parcel.ts pour
+// isoler des sous-parcelles d'orge à l'intérieur d'un contour connu — on l'
+// applique ici sans contour préalable, sur un disque de rayon radiusKm.
+const REGION_SNIC_PARAMETERS = {
+  size: 24,          // taille cible des superpixels (px, plus grand ici que la détection d'orge intra-parcelle)
+  compactness: 0.6,  // plus bas = suit mieux les contours réels des champs, plus haut = formes plus régulières
+  connectivity: 8,
+  scale: 10,         // résolution Sentinel-2 (m/pixel)
+} as const;
+const MIN_PARCEL_SEGMENT_AREA_M2 = 1_000;   // 0.1 ha
+const MAX_PARCEL_SEGMENT_AREA_M2 = 800_000; // 80 ha
+const MAX_SEGMENTATION_RADIUS_KM = 5; // au-delà, le coût de calcul GEE devient trop élevé (timeout probable)
+const CIRCLE_REGION_VERTICES = 48;
+
+// ── Alternative (optionnelle) : modèle externe de segmentation ──
 const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
 const FIELD_SEGMENTATION_MODEL_URL = process.env.FIELD_SEGMENTATION_MODEL_URL;
 const SEGMENTATION_IMAGE_SIZE = 640;
 const SEGMENTATION_MARGIN_FACTOR = 1.3;
 // Au-delà de ce rayon, la résolution d'une image 640x640 devient trop grossière
 // pour distinguer des limites de champs individuelles : on repasse sur la grille.
-const MAX_SEGMENTATION_RADIUS_KM = 3;
+const MAX_MODEL_SEGMENTATION_RADIUS_KM = 3;
 const SEGMENTATION_MIN_POLYGON_AREA_M2 = 200;
 
 type OverpassElement = {
@@ -72,8 +390,10 @@ export async function detectAutomaticParcels({ lat, lng, radiusKm, baseTemperatu
     const candidates = await discoverAgriculturalParcels(lat, lng, radiusKm);
     const config = { baseTemperature, threshold, periodDays };
     const analyzedCandidates = candidates.slice(0, MAX_CANDIDATES);
-    const segmentationFallback = analyzedCandidates.some((candidate) => candidate.tags.source === "satellite-segmentation");
-    const satelliteWindowFallback = !segmentationFallback && analyzedCandidates.some((candidate) => candidate.tags.source?.startsWith("satellite-search"));
+    const watershedFallback = analyzedCandidates.some((candidate) => candidate.tags.source === "gee-watershed-segmentation");
+    const geeSegmentationFallback = !watershedFallback && analyzedCandidates.some((candidate) => candidate.tags.source === "gee-snic-segmentation");
+    const modelSegmentationFallback = !watershedFallback && !geeSegmentationFallback && analyzedCandidates.some((candidate) => candidate.tags.source === "satellite-segmentation");
+    const satelliteWindowFallback = !watershedFallback && !geeSegmentationFallback && !modelSegmentationFallback && analyzedCandidates.some((candidate) => candidate.tags.source?.startsWith("satellite-search"));
     const analyzedParcels = await mapWithConcurrency(analyzedCandidates, ANALYSIS_CONCURRENCY, (candidate) => analyzeCandidate(candidate, config));
     const analyzedIds = new Set(analyzedCandidates.map((candidate) => candidate.id));
     const parcels = [
@@ -96,13 +416,17 @@ export async function detectAutomaticParcels({ lat, lng, radiusKm, baseTemperatu
       candidates_found: candidates.length,
       analyzed_count: parcels.filter((parcel) => parcel.analysis !== null).length,
       parcels,
-      notice: segmentationFallback
-        ? "Aucun contour vectoriel référencé : les limites de parcelles ont été détectées automatiquement par segmentation d’image satellite (IA)."
-        : satelliteWindowFallback
-          ? "Aucun contour vectoriel n’a été trouvé : plusieurs cellules satellite autour du point sont analysées sans créer de fausse parcelle en base."
-          : candidates.length === 0
-            ? "Aucun contour agricole fiable n’est référencé dans ce rayon."
-            : null,
+      notice: watershedFallback
+        ? "Aucun contour vectoriel référencé : les limites de parcelles ont été détectées automatiquement par watershed + analyse NDVI multi-temporelle (Google Earth Engine, sans modèle IA)."
+        : geeSegmentationFallback
+          ? "Aucun contour vectoriel référencé : les limites de parcelles ont été détectées automatiquement par segmentation d’image satellite (SNIC / Google Earth Engine, sans modèle IA)."
+          : modelSegmentationFallback
+            ? "Aucun contour vectoriel référencé : les limites de parcelles ont été détectées automatiquement par segmentation d’image satellite (modèle IA)."
+            : satelliteWindowFallback
+              ? "Aucun contour vectoriel n’a été trouvé : plusieurs cellules satellite autour du point sont analysées sans créer de fausse parcelle en base."
+              : candidates.length === 0
+                ? "Aucun contour agricole fiable n’est référencé dans ce rayon."
+                : null,
     };
   } catch (error) {
     // On erreur (DB, Overpass, etc.) renvoyer un fallback lisible pour le frontend
@@ -130,6 +454,20 @@ async function discoverAgriculturalParcels(lat: number, lng: number, radiusKm: n
 
   const databaseCandidates = await discoverAgriculturalParcelsFromDatabase(lat, lng, radiusKm);
   if (databaseCandidates.length > 0) return ensureCoordinateCoverage(databaseCandidates, lat, lng, radiusKm);
+
+  try {
+    const watershedCandidates = await discoverAgriculturalParcelsFromWatershed(lat, lng, radiusKm);
+    if (watershedCandidates.length > 0) return ensureCoordinateCoverage(watershedCandidates, lat, lng, radiusKm);
+  } catch (error) {
+    console.warn("discoverAgriculturalParcelsFromWatershed failed, trying next fallback:", error);
+  }
+
+  try {
+    const geeSegmentedCandidates = await discoverAgriculturalParcelsFromGeeSegmentation(lat, lng, radiusKm);
+    if (geeSegmentedCandidates.length > 0) return ensureCoordinateCoverage(geeSegmentedCandidates, lat, lng, radiusKm);
+  } catch (error) {
+    console.warn("discoverAgriculturalParcelsFromGeeSegmentation failed, trying next fallback:", error);
+  }
 
   try {
     const segmentedCandidates = await discoverAgriculturalParcelsFromSegmentation(lat, lng, radiusKm);
@@ -315,13 +653,14 @@ async function callFieldSegmentationModel(imageBase64: string): Promise<Segmenta
   return data as SegmentationModelResponse;
 }
 
+// ── Alternative (optionnelle) : segmentation par modèle externe ──
 async function discoverAgriculturalParcelsFromSegmentation(
   lat: number,
   lng: number,
   radiusKm: number,
 ): Promise<CandidateParcel[]> {
   if (!FIELD_SEGMENTATION_MODEL_URL) return [];
-  if (radiusKm > MAX_SEGMENTATION_RADIUS_KM) return [];
+  if (radiusKm > MAX_MODEL_SEGMENTATION_RADIUS_KM) return [];
 
   const zoom = zoomToFitRadius(lat, radiusKm, SEGMENTATION_IMAGE_SIZE);
   const imageBase64 = await fetchSatelliteImageBase64(lat, lng, zoom, SEGMENTATION_IMAGE_SIZE);
@@ -346,6 +685,182 @@ async function discoverAgriculturalParcelsFromSegmentation(
         source: "satellite-segmentation",
         ...(polygon.label ? { crop_hint: polygon.label } : {}),
         ...(typeof polygon.score === "number" ? { segmentation_score: String(polygon.score) } : {}),
+      },
+    }];
+  });
+}
+
+// ── Segmentation GEE/SNIC (sans modèle ML) ──
+
+function getGeeProjectId(): string {
+  const serviceAccountJson = process.env.GEE_SERVICE_ACCOUNT_KEY;
+  if (!serviceAccountJson) return "earthengine-legacy";
+  try {
+    const serviceAccount = JSON.parse(serviceAccountJson) as { project_id?: unknown };
+    return typeof serviceAccount.project_id === "string" && serviceAccount.project_id.length > 0
+      ? serviceAccount.project_id
+      : "earthengine-legacy";
+  } catch {
+    return "earthengine-legacy";
+  }
+}
+
+/** Approxime un disque de rayon radiusKm autour de (lat,lng) par un polygone à N côtés. */
+function circleRegionCoordinates(lat: number, lng: number, radiusKm: number, vertices = CIRCLE_REGION_VERTICES): number[][][] {
+  const latRad = (lat * Math.PI) / 180;
+  const metersPerDegLat = 111_320;
+  const metersPerDegLng = 111_320 * Math.cos(latRad);
+  const radiusMeters = radiusKm * 1000;
+  const ring: number[][] = [];
+  for (let i = 0; i <= vertices; i++) {
+    const angle = (2 * Math.PI * i) / vertices;
+    const dLat = (radiusMeters * Math.sin(angle)) / metersPerDegLat;
+    const dLng = (radiusMeters * Math.cos(angle)) / metersPerDegLng;
+    ring.push([lng + dLng, lat + dLat]);
+  }
+  return [ring];
+}
+
+/**
+ * Construit l'expression GEE : composite Sentinel-2 (90 derniers jours, faible
+ * nuage) -> indices spectraux (NDVI/NDWI/NDBI/BSI) -> masque végétation ->
+ * segmentation SNIC -> vectorisation en polygones lat/lng, sur un disque de
+ * rayon radiusKm autour de (lat,lng). Même logique que buildSNICVectorsExpression
+ * dans analyze-parcel.ts, mais la région est un disque libre plutôt qu'un
+ * contour de parcelle déjà connu.
+ */
+function buildRegionSnicExpression(lat: number, lng: number, radiusKm: number) {
+  const endDate = new Date().toISOString().slice(0, 10);
+  const startDate = new Date(Date.now() - 90 * 86_400_000).toISOString().slice(0, 10);
+  const values: Record<string, GeeValue> = {};
+  const reference = (name: string): GeeValue => ({ valueReference: name });
+
+  values.region = geeCall("GeometryConstructors.Polygon", {
+    coordinates: geeConstant(circleRegionCoordinates(lat, lng, radiusKm)),
+  });
+  values.intersectsRegion = geeCall("Filter.intersects", {
+    leftField: geeConstant(".all"),
+    rightValue: geeCall("Feature", { geometry: reference("region") }),
+  });
+  values.dateRange = geeCall("Filter.dateRangeContains", {
+    leftValue: geeCall("DateRange", { start: geeConstant(startDate), end: geeConstant(endDate) }),
+    rightField: geeConstant("system:time_start"),
+  });
+  values.lowCloudCover = geeCall("Filter.lessThan", {
+    leftField: geeConstant("CLOUDY_PIXEL_PERCENTAGE"),
+    rightValue: geeConstant(35),
+  });
+  values.collectionByRegion = geeCall("Collection.filter", {
+    collection: geeCall("ImageCollection.load", { id: geeConstant("COPERNICUS/S2_SR_HARMONIZED") }),
+    filter: reference("intersectsRegion"),
+  });
+  values.collectionByDate = geeCall("Collection.filter", {
+    collection: reference("collectionByRegion"),
+    filter: reference("dateRange"),
+  });
+  values.collection = geeCall("Collection.filter", {
+    collection: reference("collectionByDate"),
+    filter: reference("lowCloudCover"),
+  });
+  values.composite = geeCall("reduce.median", { collection: reference("collection") });
+  values.spectralImage = geeCall("Image.select", {
+    input: reference("composite"),
+    bandSelectors: geeConstant(["B2", "B3", "B4", "B8", "B11", "B12"]),
+  });
+  values.withNdvi = addSpectralIndex(reference("spectralImage"), "NDVI", ["B8", "B4"]);
+  values.withNdwi = addSpectralIndex(reference("withNdvi"), "NDWI", ["B3", "B8"]);
+  values.withNdbi = addSpectralIndex(reference("withNdwi"), "NDBI", ["B11", "B8"]);
+  values.segmentationImage = addBareSoilIndex(reference("withNdbi"));
+
+  const imageBand = (name: string) => geeCall("Image.select", {
+    input: reference("segmentationImage"),
+    bandSelectors: geeConstant([name]),
+  });
+  // Masque "surface agricole plausible" : végétatif, non-eau, non-bâti, non-sol nu.
+  values.ndviMask = geeCall("Image.gt", { image1: imageBand("NDVI"), image2: geeImageConstant(0.15) });
+  values.waterMask = geeCall("Image.lt", { image1: imageBand("NDWI"), image2: geeImageConstant(0.1) });
+  values.urbanMask = geeCall("Image.lt", { image1: imageBand("NDBI"), image2: geeImageConstant(0.05) });
+  values.bareSoilMask = geeCall("Image.lt", { image1: imageBand("BSI"), image2: geeImageConstant(0.25) });
+  values.fieldMask = geeCall("Image.and", {
+    image1: geeCall("Image.and", {
+      image1: geeCall("Image.and", { image1: reference("ndviMask"), image2: reference("waterMask") }),
+      image2: reference("urbanMask"),
+    }),
+    image2: reference("bareSoilMask"),
+  });
+  values.maskedImage = geeCall("Image.updateMask", {
+    image: reference("segmentationImage"),
+    mask: reference("fieldMask"),
+  });
+  values.fieldImage = geeCall("Image.clip", {
+    input: reference("maskedImage"),
+    geometry: reference("region"),
+  });
+  values.snic = geeCall("Image.Segmentation.SNIC", {
+    image: reference("fieldImage"),
+    size: geeConstant(REGION_SNIC_PARAMETERS.size),
+    compactness: geeConstant(REGION_SNIC_PARAMETERS.compactness),
+    connectivity: geeConstant(REGION_SNIC_PARAMETERS.connectivity),
+    neighborhoodSize: geeConstant(REGION_SNIC_PARAMETERS.size * 4),
+  });
+  values.snicClusters = geeCall("Image.select", {
+    input: reference("snic"),
+    bandSelectors: geeConstant(["clusters"]),
+  });
+  values.vectorsImage = geeCall("Image.addBands", {
+    dstImg: reference("snicClusters"),
+    srcImg: reference("fieldImage"),
+  });
+  values.vectors = geeCall("Image.reduceToVectors", {
+    image: reference("vectorsImage"),
+    reducer: geeCall("Reducer.mean", {}),
+    geometry: reference("region"),
+    scale: geeConstant(REGION_SNIC_PARAMETERS.scale),
+    geometryType: geeConstant("polygon"),
+    eightConnected: geeConstant(true),
+    labelProperty: geeConstant("segment_id"),
+    bestEffort: geeConstant(true),
+    maxPixels: geeConstant(30_000_000),
+    tileScale: geeConstant(4),
+  });
+
+  return { expression: { result: "vectors", values } };
+}
+
+async function discoverAgriculturalParcelsFromGeeSegmentation(
+  lat: number,
+  lng: number,
+  radiusKm: number,
+): Promise<CandidateParcel[]> {
+  const serviceAccountJson = process.env.GEE_SERVICE_ACCOUNT_KEY;
+  if (!serviceAccountJson || serviceAccountJson.startsWith("VOTRE_")) return [];
+  if (radiusKm > MAX_SEGMENTATION_RADIUS_KM) return [];
+
+  const accessToken = await getGeeAccessToken();
+  const projectId = getGeeProjectId();
+  const raw = await callGeeComputeRaw(accessToken, projectId, buildRegionSnicExpression(lat, lng, radiusKm));
+  const result = raw.result;
+  if (!isGeeFeatureCollection(result)) return [];
+
+  return result.features.flatMap((feature, index): CandidateParcel[] => {
+    if (!feature || typeof feature !== "object") return [];
+    const { geometry, properties } = feature as { geometry?: unknown; properties?: unknown };
+    const coordinates = extractLatLngFromGeometry(geometry);
+    if (coordinates.length < 3) return [];
+
+    const areaM2 = approximatePolygonAreaM2(coordinates);
+    if (areaM2 < MIN_PARCEL_SEGMENT_AREA_M2 || areaM2 > MAX_PARCEL_SEGMENT_AREA_M2) return [];
+
+    const props = properties && typeof properties === "object" ? properties as Record<string, unknown> : {};
+    const ndvi = typeof props.NDVI === "number" ? props.NDVI : undefined;
+
+    return [{
+      id: `gee-snic-${lat.toFixed(6)}-${lng.toFixed(6)}-${index}`,
+      coordinates,
+      center: polygonCenter(coordinates),
+      tags: {
+        source: "gee-snic-segmentation",
+        ...(ndvi !== undefined ? { ndvi_hint: String(Math.round(ndvi * 1000) / 1000) } : {}),
       },
     }];
   });
@@ -415,7 +930,6 @@ async function discoverAgriculturalParcelsFromDatabase(lat: number, lng: number,
       where: {
         center_lat: { gte: minLat, lte: maxLat },
         center_lng: { gte: minLng, lte: maxLng },
-        NOT: { label: { startsWith: AUTOMATIC_SEGMENT_LABEL_PREFIX } },
       },
     });
   } catch (error) {
@@ -720,81 +1234,6 @@ async function saveAutomaticAnalysis(candidate: CandidateParcel, analysis: Recor
   } else {
     await prisma.parcelle.create({ data });
   }
-
-  await saveDetectedBarleySegments(candidate, analysis);
-}
-
-async function saveDetectedBarleySegments(candidate: CandidateParcel, analysis: Record<string, unknown>): Promise<void> {
-  const labelPrefix = `${AUTOMATIC_SEGMENT_LABEL_PREFIX}${candidate.id}:`;
-  await prisma.parcelle.deleteMany({ where: { label: { startsWith: labelPrefix } } });
-
-  const rawSegments = Array.isArray(analysis.detected_segments) ? analysis.detected_segments : [];
-  for (const [index, rawSegment] of rawSegments.entries()) {
-    if (!rawSegment || typeof rawSegment !== "object") continue;
-    const segment = rawSegment as Record<string, unknown>;
-    const coordinates = asCoordinateArray(segment.coordinates);
-    const confidence = asNumber(segment.confidence);
-    const areaHa = asNumber(segment.area_ha);
-    if (!coordinates || confidence == null || areaHa == null) continue;
-
-    const ndvi = asNumber(segment.ndvi);
-    const ndviPercentage = ndvi == null ? null : Math.round(ndvi * 1000) / 10;
-    const label = `${labelPrefix}${index}`;
-    const data: Prisma.ParcelleUncheckedCreateInput = {
-      label,
-      coordinates,
-      center_lat: coordinates.reduce((sum, point) => sum + point.lat, 0) / coordinates.length,
-      center_lng: coordinates.reduce((sum, point) => sum + point.lng, 0) / coordinates.length,
-      surface_ha: areaHa,
-      culture_declared: asString(analysis.culture_declared),
-      culture_detected: "Orge",
-      ndvi_percentage: ndviPercentage,
-      confidence,
-      verdict: "CONFORME",
-      details: `Segment d’orge détecté automatiquement (${confidence}%).`,
-      saison: asString(analysis.saison),
-      soil_type: asString(analysis.soil_type),
-      risk_factors: asStringArray(analysis.risk_factors),
-      recommendations: asString(analysis.recommendations),
-      data_source: `${asString(analysis.data_source) ?? "Analyse automatique"} + Segmentation d’orge`,
-      owner_name: asString(candidate.tags.owner) ?? "Orge détectée",
-      notes: "Contour d’orge détecté automatiquement.",
-      time_series_s1: Array.isArray(analysis.time_series_s1) ? analysis.time_series_s1 : [],
-      time_series_s2: Array.isArray(analysis.time_series_s2) ? analysis.time_series_s2 : [],
-      estimated_planting_date: asString(analysis.estimated_planting_date),
-      estimated_harvest_date: asString(analysis.estimated_harvest_date),
-      days_since_planting: Number.isInteger(analysis.days_since_planting) ? analysis.days_since_planting as number : null,
-      growth_stage: asString(analysis.growth_stage),
-      planting_confidence: asNumber(analysis.planting_confidence),
-      evi: asNumber(analysis.evi),
-      savi: asNumber(analysis.savi),
-      ndwi: asNumber(analysis.ndwi),
-      agro_score: asNumber(analysis.agro_score),
-      hybrid_score: asNumber(analysis.hybrid_score),
-      cnn_prob_barley: asNumber(analysis.cnn_prob_barley),
-      cnn_prob_non_barley: asNumber(analysis.cnn_prob_non_barley),
-    };
-
-    const existing = await prisma.parcelle.findFirst({ where: { label }, select: { id: true } });
-    if (existing) {
-      await prisma.parcelle.update({ where: { id: existing.id }, data });
-    } else {
-      await prisma.parcelle.create({ data });
-    }
-  }
-}
-
-function asCoordinateArray(value: unknown): Array<{ lat: number; lng: number }> | null {
-  if (!Array.isArray(value)) return null;
-  const coordinates = value.flatMap((point) => {
-    if (!point || typeof point !== "object") return [];
-    const values = point as Record<string, unknown>;
-    return typeof values.lat === "number" && Number.isFinite(values.lat)
-      && typeof values.lng === "number" && Number.isFinite(values.lng)
-      ? [{ lat: values.lat, lng: values.lng }]
-      : [];
-  });
-  return coordinates.length >= 3 ? coordinates : null;
 }
 
 function formatDate(date: Date): string {

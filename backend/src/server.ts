@@ -80,6 +80,8 @@ const parcelleSchema = z.object({
   culture_declared: z.string(),
   culture_detected: z.string().nullable(),
   ndvi_percentage: z.number().nullable(),
+  ndre: z.number().nullable(),
+  spectral_bands: z.record(z.string(), z.number().nullable()).nullable(),
   confidence: z.number().nullable(),
   verdict: z.string().nullable(),
   details: z.string().nullable(),
@@ -141,7 +143,7 @@ app.post("/api/parcelles", async (request, reply) => {
   const parsed = parcelleSchema.safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: "Données de parcelle invalides", details: parsed.error.flatten() });
 
-  const { coordinates, risk_factors, time_series_s1, time_series_s2, ...scalarData } = parsed.data;
+  const { coordinates, risk_factors, time_series_s1, time_series_s2, spectral_bands, ...scalarData } = parsed.data;
   const parcelle = await prisma.parcelle.create({
     data: {
       ...scalarData,
@@ -149,6 +151,7 @@ app.post("/api/parcelles", async (request, reply) => {
       risk_factors: jsonValue(risk_factors),
       time_series_s1: jsonValue(time_series_s1),
       time_series_s2: jsonValue(time_series_s2),
+      spectral_bands: spectral_bands === null ? Prisma.JsonNull : jsonValue(spectral_bands),
     },
   });
   parcellesCache = null;
