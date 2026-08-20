@@ -38,6 +38,8 @@ export interface AnalysisResultData {
   agro_breakdown?: { ndvi_score: number; cycle_score: number; radar_score: number; ndvi_trend_score: number };
   agro_details?: string;
   hybrid_score?: number | null;
+  warnings?: string[];
+  boundary_source?: string;
 }
 
 interface AnalysisPopupProps {
@@ -166,7 +168,7 @@ export default function AnalysisPopup({ position, polygon, center, zoom, onClose
 
     analyze();
     return () => { cancelled = true; };
-  }, [center.lat, center.lng, zoom]);
+  }, [center.lat, center.lng, notes, onSave, ownerName, polygon, zoom]);
 
   useEffect(() => {
     if (stage === "percentage" && result) {
@@ -219,6 +221,16 @@ export default function AnalysisPopup({ position, polygon, center, zoom, onClose
       <div className="text-xs text-muted-foreground mono mb-3">
         {center.lat.toFixed(5)}, {center.lng.toFixed(5)} · {polygon.length} pts
       </div>
+      {result?.boundary_source && (
+        <p className="mb-3 text-[11px] text-muted-foreground">{result.boundary_source}</p>
+      )}
+
+      {result?.warnings && result.warnings.length > 0 && (
+        <div className="mb-3 rounded-md border border-amber-300/70 bg-amber-100/70 px-2.5 py-2 text-[11px] text-amber-900">
+          <p className="font-semibold">Analyse partielle</p>
+          <p>{result.warnings.join(" · ")}</p>
+        </div>
+      )}
 
       <AnimatePresence mode="wait">
         {stage === "loading" && (

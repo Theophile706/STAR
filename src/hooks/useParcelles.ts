@@ -56,34 +56,41 @@ export function useParcelles() {
   const [parcelles, setParcelles] = useState<Parcelle[]>([]);
   const [loading, setLoading] = useState(true);
 
-  const mapRow = (row: any): Parcelle => ({
-    ...row,
-    coordinates: row.coordinates as Array<{ lat: number; lng: number }>,
-    risk_factors: (row.risk_factors as string[]) || [],
-    owner_name: row.owner_name || "",
-    notes: row.notes || "",
-    time_series_s2: (row.time_series_s2 as TimeSeriesPointS2[]) || [],
-    time_series_s1: (row.time_series_s1 as TimeSeriesPointS1[]) || [],
-    estimated_planting_date: row.estimated_planting_date || null,
-    estimated_harvest_date: row.estimated_harvest_date || null,
-    days_since_planting: row.days_since_planting ?? null,
-    growth_stage: row.growth_stage || null,
-    planting_confidence: row.planting_confidence ?? null,
-    evi: row.evi ?? null,
-    savi: row.savi ?? null,
-    ndwi: row.ndwi ?? null,
-    agro_score: row.agro_score ?? null,
-    hybrid_score: row.hybrid_score ?? null,
-    cnn_prob_barley: row.cnn_prob_barley ?? null,
-    cnn_prob_non_barley: row.cnn_prob_non_barley ?? null,
-  });
+  const mapRow = (row: unknown): Parcelle => {
+    if (!row || typeof row !== "object") throw new Error("Réponse parcelle invalide");
+    const value = row as Record<string, unknown>;
+    return {
+      ...(value as unknown as Parcelle),
+      coordinates: value.coordinates as Array<{ lat: number; lng: number }>,
+      risk_factors: (value.risk_factors as string[]) || [],
+      owner_name: typeof value.owner_name === "string" ? value.owner_name : "",
+      notes: typeof value.notes === "string" ? value.notes : "",
+      time_series_s2: (value.time_series_s2 as TimeSeriesPointS2[]) || [],
+      time_series_s1: (value.time_series_s1 as TimeSeriesPointS1[]) || [],
+      estimated_planting_date: typeof value.estimated_planting_date === "string" ? value.estimated_planting_date : null,
+      estimated_harvest_date: typeof value.estimated_harvest_date === "string" ? value.estimated_harvest_date : null,
+      days_since_planting: typeof value.days_since_planting === "number" ? value.days_since_planting : null,
+      growth_stage: typeof value.growth_stage === "string" ? value.growth_stage : null,
+      planting_confidence: typeof value.planting_confidence === "number" ? value.planting_confidence : null,
+      evi: typeof value.evi === "number" ? value.evi : null,
+      savi: typeof value.savi === "number" ? value.savi : null,
+      ndwi: typeof value.ndwi === "number" ? value.ndwi : null,
+      agro_score: typeof value.agro_score === "number" ? value.agro_score : null,
+      hybrid_score: typeof value.hybrid_score === "number" ? value.hybrid_score : null,
+      cnn_prob_barley: typeof value.cnn_prob_barley === "number" ? value.cnn_prob_barley : null,
+      cnn_prob_non_barley: typeof value.cnn_prob_non_barley === "number" ? value.cnn_prob_non_barley : null,
+    };
+  };
 
   const fetchParcelles = useCallback(async () => {
     try {
       const response = await fetch(`${API_URL}/api/parcelles`);
       if (!response.ok) throw new Error("Impossible de charger les parcelles");
-      const data = await response.json();
-      setParcelles(data.map((row: any) => mapRow(row)));
+      const data: unknown = await response.json();
+      if (!Array.isArray(data)) throw new Error("Réponse parcelles invalide");
+      setParcelles(data.map(mapRow));
+    } catch (error) {
+      console.warn("Chargement des parcelles indisponible :", error);
     } finally {
       setLoading(false);
     }

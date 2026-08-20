@@ -39,9 +39,9 @@ export default function PolygonDrawer({ map, onPolygonComplete }: PolygonDrawerP
     if (pointsRef.current.length > 1) {
       polylineRef.current = new google.maps.Polyline({
         path: pointsRef.current,
-        strokeColor: "hsl(85, 45%, 50%)",
-        strokeWeight: 2,
-        strokeOpacity: 0.8,
+        strokeColor: "#ef4444",
+        strokeWeight: 4,
+        strokeOpacity: 1,
         map,
       });
     }
@@ -71,11 +71,11 @@ export default function PolygonDrawer({ map, onPolygonComplete }: PolygonDrawerP
         map,
         icon: {
           path: google.maps.SymbolPath.CIRCLE,
-          scale: 6,
-          fillColor: "hsl(85, 45%, 50%)",
+          scale: 7,
+          fillColor: "#ef4444",
           fillOpacity: 1,
-          strokeColor: "hsl(140, 10%, 6%)",
-          strokeWeight: 2,
+          strokeColor: "#ffffff",
+          strokeWeight: 3,
         },
       });
       markersRef.current.push(marker);

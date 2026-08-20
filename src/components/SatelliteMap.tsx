@@ -3,9 +3,11 @@ import { GoogleMap, useJsApiLoader } from "@react-google-maps/api";
 import AutomaticParcelOverlays from "./AutomaticParcelOverlays";
 import CoordinateInput from "./CoordinateInput";
 import ParcelOverlays from "./ParcelOverlays";
+import PolygonDrawer from "./PolygonDrawer";
+import AnalysisPopup from "./AnalysisPopup";
 import { useNavigate } from "react-router-dom";
 import { BarChart3 } from "lucide-react";
-import { searchAutomaticParcels, type AutomaticParcelSearchResult } from "@/lib/automatic-parcels";
+import { getDetectedBarleySegments, searchAutomaticParcels, type AutomaticParcelSearchResult } from "@/lib/automatic-parcels";
 import type { BarleyDetectionConfig } from "@/lib/barley-detection";
 import { useParcelles } from "@/hooks/useParcelles";
 
@@ -18,6 +20,13 @@ const ANALYSIS_VIEWPORT_PADDING = 1.25;
 const LIBRARIES: ("geometry")[] = ["geometry"];
 
 const mapContainerStyle = { width: "100%", height: "100%" };
+
+type DrawnParcel = {
+  points: Array<{ lat: number; lng: number }>;
+  center: { lat: number; lng: number };
+  ownerName: string;
+  notes: string;
+};
 
 const mapOptions: google.maps.MapOptions = {
   mapTypeId: "satellite",
@@ -33,16 +42,20 @@ export default function SatelliteMap() {
   const mapRef = useRef<google.maps.Map | null>(null);
   const searchAreaRef = useRef<google.maps.Circle | null>(null);
   const cursorMarkerRef = useRef<google.maps.Marker | null>(null);
+  const drawnPolygonRef = useRef<google.maps.Polygon | null>(null);
   const [located, setLocated] = useState(false);
   const [pinMarker, setPinMarker] = useState<google.maps.Marker | null>(null);
   const [pickedLocation, setPickedLocation] = useState<{ lat: number; lng: number } | null>(null);
   const [searchResult, setSearchResult] = useState<AutomaticParcelSearchResult | null>(null);
   const [isSearching, setIsSearching] = useState(false);
   const [searchError, setSearchError] = useState("");
+  const [drawnParcel, setDrawnParcel] = useState<DrawnParcel | null>(null);
   const navigate = useNavigate();
-  const { parcelles } = useParcelles();
-  const confirmedBarleyCount = searchResult?.parcels.filter((parcel) => parcel.analysis?.barley_presence === "confirmed").length ?? 0;
-  const probableBarleyCount = searchResult?.parcels.filter((parcel) => parcel.analysis?.barley_presence === "probable").length ?? 0;
+  const { parcelles, addParcelle } = useParcelles();
+  const displayedBarleySegmentCount = searchResult?.parcels.reduce(
+    (total, parcel) => total + getDetectedBarleySegments(parcel).length,
+    0,
+  ) ?? 0;
 
   const { isLoaded } = useJsApiLoader({
     googleMapsApiKey: GOOGLE_MAPS_API_KEY,
@@ -135,11 +148,10 @@ export default function SatelliteMap() {
     searchAreaRef.current = new google.maps.Circle({
       center: latlng,
       radius: radiusKm * 1000,
-      strokeColor: "#facc15",
+      strokeColor: "#ffffff",
       strokeOpacity: 0.55,
       strokeWeight: 2,
-      fillColor: "#facc15",
-      fillOpacity: 0.04,
+      fillOpacity: 0,
       map,
     });
   }, [pinMarker]);
@@ -158,8 +170,34 @@ export default function SatelliteMap() {
     }
   }, []);
 
+  const handlePolygonComplete = useCallback((points: Array<{ lat: number; lng: number }>, ownerName: string, notes: string) => {
+    const map = mapRef.current;
+    if (!map) return;
+    const bounds = new google.maps.LatLngBounds();
+    points.forEach((point) => bounds.extend(point));
+    map.fitBounds(bounds);
+    setDrawnParcel({ points, center: polygonCenter(points), ownerName, notes });
+  }, []);
+
+  useEffect(() => {
+    drawnPolygonRef.current?.setMap(null);
+    drawnPolygonRef.current = null;
+    if (!drawnParcel || !mapRef.current) return;
+    drawnPolygonRef.current = new google.maps.Polygon({
+      paths: drawnParcel.points,
+      strokeColor: "#ef4444",
+      strokeWeight: 5,
+      strokeOpacity: 1,
+      fillColor: "#ef4444",
+      fillOpacity: 0.18,
+      zIndex: 40,
+      map: mapRef.current,
+    });
+  }, [drawnParcel]);
+
   useEffect(() => () => {
     searchAreaRef.current?.setMap(null);
+    drawnPolygonRef.current?.setMap(null);
   }, []);
 
   if (!isLoaded) {
@@ -210,11 +248,26 @@ export default function SatelliteMap() {
         </div>
       </div>
 
-      {/* Existing saved parcel overlays */}
+      {/* Parcelles enregistrées dans la base de données */}
       <ParcelOverlays map={mapRef.current} parcelles={parcelles} />
 
       {/* Parcels discovered from the GPS search */}
       <AutomaticParcelOverlays map={mapRef.current} parcels={searchResult?.parcels ?? []} />
+
+      <PolygonDrawer map={mapRef.current} onPolygonComplete={handlePolygonComplete} />
+
+      {drawnParcel && (
+        <AnalysisPopup
+          position={{ x: window.innerWidth / 2, y: Math.max(120, window.innerHeight / 2) }}
+          polygon={drawnParcel.points}
+          center={drawnParcel.center}
+          zoom={mapRef.current?.getZoom() ?? TARGET_ZOOM}
+          onClose={() => setDrawnParcel(null)}
+          onSave={addParcelle}
+          ownerName={drawnParcel.ownerName}
+          notes={drawnParcel.notes}
+        />
+      )}
 
       {/* Automatic GPS search */}
       <CoordinateInput
@@ -246,13 +299,20 @@ export default function SatelliteMap() {
       {searchResult && (
         <div className="absolute bottom-8 left-4 right-32 sm:left-1/2 sm:right-auto sm:-translate-x-1/2 sm:max-w-lg z-[800] analysis-popup px-4 py-2.5 animate-fade-in">
           <p className="text-xs text-muted-foreground">
-            <span className="inline-block w-2.5 h-2.5 rounded-sm bg-orange-400 mr-2 align-middle" />
-            {probableBarleyCount} zone(s) probable(s) · {searchResult.candidates_found} parcelle(s) agricole(s)
+            <span className="inline-block w-2.5 h-2.5 rounded-sm border-2 border-yellow-400 mr-2 align-middle" />
+            {displayedBarleySegmentCount} contour(s) d’orge détecté(s) · {searchResult.candidates_found} zone(s) analysée(s)
           </p>
         </div>
       )}
     </div>
   );
+}
+
+function polygonCenter(points: Array<{ lat: number; lng: number }>): { lat: number; lng: number } {
+  return {
+    lat: points.reduce((sum, point) => sum + point.lat, 0) / points.length,
+    lng: points.reduce((sum, point) => sum + point.lng, 0) / points.length,
+  };
 }
 
 function boundsForRadius(lat: number, lng: number, radiusKm: number): google.maps.LatLngBoundsLiteral {

@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { DEFAULT_BARLEY_DETECTION_CONFIG, type BarleyDetectionConfig } from "@/lib/barley-detection";
-import { isAutomaticBarleyParcel, type AutomaticParcelSearchResult } from "@/lib/automatic-parcels";
+import { getDetectedBarleySegments, type AutomaticParcelSearchResult } from "@/lib/automatic-parcels";
 import { LocateFixed, MapPinned, Navigation, Radar, ThermometerSun } from "lucide-react";
 
 interface CoordinateInputProps {
@@ -17,7 +17,8 @@ interface CoordinateInputProps {
 export default function CoordinateInput({ onNavigate, onSearch, search, isSearching, searchError, pickedLocation }: CoordinateInputProps) {
   const [lat, setLat] = useState("");
   const [lng, setLng] = useState("");
-  const [radiusKm, setRadiusKm] = useState("10");
+  const [radiusValue, setRadiusValue] = useState("10");
+  const [radiusUnit, setRadiusUnit] = useState<"m" | "km">("km");
   const [baseTemperature, setBaseTemperature] = useState(String(DEFAULT_BARLEY_DETECTION_CONFIG.baseTemperature));
   const [threshold, setThreshold] = useState(String(DEFAULT_BARLEY_DETECTION_CONFIG.threshold));
   const [periodDays, setPeriodDays] = useState("130");
@@ -25,7 +26,7 @@ export default function CoordinateInput({ onNavigate, onSearch, search, isSearch
   const [validationError, setValidationError] = useState("");
   const [isLocating, setIsLocating] = useState(false);
   const [locationError, setLocationError] = useState("");
-  const confirmedParcels = search?.parcels.filter((parcel) => parcel.analysis?.barley_presence === "confirmed") ?? [];
+  const detectedSegments = search?.parcels.flatMap(getDetectedBarleySegments) ?? [];
 
   useEffect(() => {
     if (!pickedLocation) return;
@@ -48,7 +49,7 @@ export default function CoordinateInput({ onNavigate, onSearch, search, isSearch
         setLat(latNum.toFixed(6));
         setLng(lngNum.toFixed(6));
         setIsLocating(false);
-        const radiusNum = Number(radiusKm);
+        const radiusNum = toRadiusKm(radiusValue, radiusUnit);
         onNavigate(latNum, lngNum, Number.isFinite(radiusNum) ? radiusNum : 10);
       },
       (error) => {
@@ -67,7 +68,8 @@ export default function CoordinateInput({ onNavigate, onSearch, search, isSearch
     e.preventDefault();
     const latNum = Number(lat);
     const lngNum = Number(lng);
-    const radiusNum = Number(radiusKm);
+    const radiusInput = Number(radiusValue);
+    const radiusNum = radiusUnit === "m" ? radiusInput / 1000 : radiusInput;
     const config = {
       baseTemperature: Number(baseTemperature),
       threshold: Number(threshold),
@@ -78,8 +80,8 @@ export default function CoordinateInput({ onNavigate, onSearch, search, isSearch
       setValidationError("Saisissez une latitude et une longitude valides.");
       return;
     }
-    if (!Number.isFinite(radiusNum) || radiusNum < 1 || radiusNum > 20) {
-      setValidationError("Le rayon doit être compris entre 1 et 20 km.");
+    if (!Number.isFinite(radiusInput) || radiusInput <= 0 || !Number.isFinite(radiusNum) || radiusNum < 0.05 || radiusNum > 20) {
+      setValidationError("Le rayon doit être compris entre 50 m et 20 km.");
       return;
     }
     if (!Number.isFinite(config.baseTemperature) || config.baseTemperature < -20 || config.baseTemperature > 30) {
@@ -147,12 +149,27 @@ export default function CoordinateInput({ onNavigate, onSearch, search, isSearch
           className="bg-background/50 text-sm h-9"
         />
         <label className="block text-xs text-muted-foreground">
-          Rayon d’analyse
-          <div className="relative mt-1">
-            <Input type="number" min="1" max="20" step="1" value={radiusKm} onChange={(e) => setRadiusKm(e.target.value)} className="bg-background/50 text-sm h-9 pr-10" />
-            <span className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-muted-foreground">km</span>
+          Rayon terrain réel
+          <div className="mt-1 flex gap-1">
+            <Input
+              type="number"
+              min={radiusUnit === "m" ? "50" : "0.05"}
+              max={radiusUnit === "m" ? "20000" : "20"}
+              step={radiusUnit === "m" ? "10" : "0.05"}
+              value={radiusValue}
+              onChange={(e) => setRadiusValue(e.target.value)}
+              className="bg-background/50 text-sm h-9 flex-1"
+            />
+            <select
+              value={radiusUnit}
+              onChange={(e) => setRadiusUnit(e.target.value as "m" | "km")}
+              className="h-9 rounded-md border border-input bg-background/50 px-2 text-sm text-foreground"
+            >
+              <option value="m">m</option>
+              <option value="km">km</option>
+            </select>
           </div>
-          <span className="mt-1 block text-[11px]">De 1 à 20 km · recommandé : 5, 10 ou 20 km</span>
+          <span className="mt-1 block text-[11px]">Distance au sol, indépendante du zoom · 50 m à 20 km</span>
         </label>
         <div className="rounded-lg border border-border/70 bg-muted/40 p-2.5 space-y-2">
           <div className="flex items-center gap-1.5 text-xs font-medium text-foreground">
@@ -187,48 +204,53 @@ export default function CoordinateInput({ onNavigate, onSearch, search, isSearch
         <div className="mt-3 rounded-lg border border-border bg-muted/40 p-3 space-y-2">
           <div className="flex items-center justify-between">
             <p className="text-sm font-semibold text-foreground">Résultat de la zone</p>
-            <span className="text-xs font-mono text-muted-foreground">{search.radius_km} km</span>
+            <span className="text-xs font-mono text-muted-foreground">{formatGroundRadius(search.radius_km)}</span>
           </div>
           <div className="grid grid-cols-2 gap-2 text-center">
             <div className="rounded-md bg-background/60 p-2">
               <p className="text-lg font-semibold text-foreground">{search.candidates_found}</p>
-              <p className="text-[10px] text-muted-foreground">parcelles trouvées</p>
+              <p className="text-[10px] text-muted-foreground">zones candidates</p>
             </div>
             <div className="rounded-md bg-yellow-300/30 p-2">
-              <p className="text-lg font-semibold text-yellow-700">{search.parcels.filter(isAutomaticBarleyParcel).length}</p>
-              <p className="text-[10px] text-yellow-800">parcelles d’orge</p>
+              <p className="text-lg font-semibold text-yellow-700">{detectedSegments.length}</p>
+              <p className="text-[10px] text-yellow-800">objets d’orge</p>
             </div>
           </div>
-          <p className="text-[11px] text-muted-foreground">{search.analyzed_count} parcelle(s) analysée(s) par HF + satellite.</p>
+          <p className="text-[11px] text-muted-foreground">Rayon terrain réel : {search.radius_km} km · {search.analyzed_count} zone(s) analysée(s) par cellules, puis segmentée(s) par SNIC avant la classification HF.</p>
           <p className="text-[11px] text-muted-foreground">Degrés-jours requis : {search.threshold} °C · Tbase : {search.base_temperature} °C · période : {search.period_days} jours.</p>
           {search.notice && <p className="rounded-md bg-amber-100/80 px-2 py-1.5 text-[11px] text-amber-900">{search.notice}</p>}
-          {search.parcels.some((parcel) => parcel.analysis?.barley_presence === "probable") && <p className="text-[11px] text-orange-700">Orange : zone de présence probable d’orge. Jaune : orge confirmée.</p>}
+          <p className="text-[11px] text-yellow-800">Jaune : uniquement les objets SNIC que le modèle HF a classifiés comme Orge.</p>
           {search.candidates_found > search.analyzed_count && <p className="text-[11px] text-amber-700">La zone contient plus de candidates que la limite d’analyse automatique.</p>}
-          {confirmedParcels.length > 0 && (
+          {detectedSegments.length > 0 && (
             <div className="rounded-md border border-yellow-400/70 bg-yellow-300/20 p-2.5 space-y-2">
               <div className="flex items-center justify-between">
-                <p className="text-xs font-semibold text-yellow-900">Orge confirmée</p>
-                <span className="text-[11px] font-medium text-yellow-800">{confirmedParcels.length} parcelle(s)</span>
+                <p className="text-xs font-semibold text-yellow-900">Objets d’orge détectés</p>
+                <span className="text-[11px] font-medium text-yellow-800">{detectedSegments.length} objet(s)</span>
               </div>
-              {confirmedParcels.map((parcel, index) => {
-                const analysis = parcel.analysis;
-                return (
-                  <div key={parcel.id} className="rounded-md bg-background/70 p-2 text-[11px] text-foreground space-y-1">
-                    <div className="flex items-center justify-between font-medium">
-                      <span>Parcelle confirmée {index + 1}</span>
-                      <span className="text-yellow-700">Confiance : {analysis?.confidence ?? "—"}%</span>
-                    </div>
-                    <p>Culture : {analysis?.culture_detected ?? "—"}</p>
-                    <p>Verdict : {analysis?.verdict ?? "—"}</p>
-                    {analysis?.details && <p>Détails : {analysis.details}</p>}
-                    {analysis?.data_source && <p>Source : {analysis.data_source}</p>}
+              {detectedSegments.map((segment, index) => (
+                <div key={`${segment.coordinates[0]?.lat}-${segment.coordinates[0]?.lng}-${index}`} className="rounded-md bg-background/70 p-2 text-[11px] text-foreground space-y-1">
+                  <div className="flex items-center justify-between font-medium">
+                    <span>Parcelle {index + 1}</span>
+                    <span className="text-yellow-700">Confiance : {segment.confidence}%</span>
                   </div>
-                );
-              })}
+                  <p>Surface : {segment.area_ha} ha</p>
+                  <p>NDVI : {segment.ndvi?.toFixed(2) ?? "—"}</p>
+                </div>
+              ))}
             </div>
           )}
         </div>
       )}
     </div>
   );
+}
+
+function toRadiusKm(value: string, unit: "m" | "km"): number {
+  const numericValue = Number(value);
+  return unit === "m" ? numericValue / 1000 : numericValue;
+}
+
+function formatGroundRadius(radiusKm: number): string {
+  const meters = Math.round(radiusKm * 1000);
+  return meters < 1000 ? `${meters} m au sol` : `${Number(radiusKm.toFixed(2))} km au sol`;
 }

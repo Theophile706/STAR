@@ -11,12 +11,62 @@ const app = Fastify({ logger: true });
 const prisma = new PrismaClient();
 
 const jsonValue = (value: unknown) => value as Prisma.InputJsonValue;
+type ParcelleRow = Awaited<ReturnType<typeof prisma.parcelle.findMany>>[number];
+
+const PARCELLES_CACHE_TTL_MS = 30_000;
+const PARCELLES_QUERY_TIMEOUT_MS = 8_000;
+
+let parcellesCache: { expiresAt: number; rows: ParcelleRow[] } | null = null;
+let parcellesRequest: Promise<ParcelleRow[]> | null = null;
+
+async function loadParcelles(): Promise<ParcelleRow[]> {
+  const now = Date.now();
+  if (parcellesCache && parcellesCache.expiresAt > now) return parcellesCache.rows;
+  if (!parcellesRequest) {
+    parcellesRequest = withTimeout(
+      prisma.parcelle.findMany({ orderBy: { created_at: "desc" } }),
+      PARCELLES_QUERY_TIMEOUT_MS,
+    );
+  }
+
+  try {
+    const rows = await parcellesRequest;
+    parcellesCache = { rows, expiresAt: Date.now() + PARCELLES_CACHE_TTL_MS };
+    return rows;
+  } catch (error) {
+    if (parcellesCache) {
+      app.log.warn({ err: error }, "parcelles: database unavailable, serving cached rows");
+      return parcellesCache.rows;
+    }
+    throw error;
+  } finally {
+    parcellesRequest = null;
+  }
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`Requête base de données dépassant ${timeoutMs} ms.`));
+    }, timeoutMs);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
 
 const pointSchema = z.object({ lat: z.number(), lng: z.number() });
 const automaticDetectionSchema = z.object({
   lat: z.number().finite().min(-90).max(90),
   lng: z.number().finite().min(-180).max(180),
-  radiusKm: z.number().finite().min(1).max(20),
+  radiusKm: z.number().finite().min(0.05).max(20),
   baseTemperature: z.number().finite().min(-20).max(30),
   threshold: z.number().finite().min(2200).max(10000),
   periodDays: z.number().int().min(1).max(730),
@@ -74,12 +124,17 @@ app.post("/api/detect-parcels-fallback", async (request, reply) => {
   const parsed = automaticDetectionSchema.safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: "Coordonnées ou rayon invalides.", details: parsed.error.flatten() });
   const result = await detectAutomaticParcels(parsed.data);
+  parcellesCache = null;
   return reply.send(result);
 });
 
 app.get("/api/parcelles", async (_request, reply) => {
-  const parcelles = await prisma.parcelle.findMany({ orderBy: { created_at: "desc" } });
-  return reply.send(parcelles);
+  try {
+    return reply.send(await loadParcelles());
+  } catch (error) {
+    app.log.error({ err: error }, "parcelles: read failed");
+    return reply.code(503).send({ error: "Les parcelles sont temporairement indisponibles." });
+  }
 });
 
 app.post("/api/parcelles", async (request, reply) => {
@@ -96,6 +151,7 @@ app.post("/api/parcelles", async (request, reply) => {
       time_series_s2: jsonValue(time_series_s2),
     },
   });
+  parcellesCache = null;
   return reply.code(201).send(parcelle);
 });
 
@@ -104,6 +160,7 @@ app.delete("/api/parcelles/:id", async (request, reply) => {
   if (!id.success) return reply.code(400).send({ error: "Identifiant invalide" });
   const result = await prisma.parcelle.deleteMany({ where: { id: id.data } });
   if (result.count === 0) return reply.code(404).send({ error: "Parcelle introuvable" });
+  parcellesCache = null;
   return reply.code(204).send();
 });
 
@@ -121,6 +178,7 @@ app.post("/api/detect-parcels", async (request, reply) => {
   if (!parsed.success) return reply.code(400).send({ error: "Coordonnées ou rayon invalides.", details: parsed.error.flatten() });
   try {
     const result = await detectAutomaticParcels(parsed.data);
+    parcellesCache = null;
     return reply.send(result);
   } catch (error) {
     app.log.warn({ err: error }, "detect-parcels: discovery failed, returning fallback notice");
