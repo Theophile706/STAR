@@ -8,6 +8,7 @@ import PolygonDrawer from "./PolygonDrawer";
 import AnalysisPopup from "./AnalysisPopup";
 import { useNavigate } from "react-router-dom";
 import { BarChart3 } from "lucide-react";
+import brocheIconUrl from "@/img/broche.png";
 import { getDetectedBarleySegments, searchAutomaticParcels, type AutomaticParcelSearchResult } from "@/lib/automatic-parcels";
 import { runSimpleAnalysis, type SimpleAnalysisResult } from "@/lib/barley-detect-simple";
 import type { BarleyDetectionConfig } from "@/lib/barley-detection";
@@ -78,12 +79,9 @@ export default function SatelliteMap() {
         cursor: "grab",
         zIndex: 999,
         icon: {
-          path: google.maps.SymbolPath.CIRCLE,
-          scale: 8,
-          fillColor: "hsl(142, 50%, 45%)",
-          fillOpacity: 0.9,
-          strokeColor: "#ffffff",
-          strokeWeight: 2,
+          url: brocheIconUrl,
+          scaledSize: new google.maps.Size(40, 40),
+          anchor: new google.maps.Point(20, 40),
         },
         title: "Glissez ou touchez la carte pour choisir un point GPS",
       });

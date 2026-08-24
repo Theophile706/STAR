@@ -158,7 +158,7 @@ export default function CoordinateInput({
         </button>
       </div>
       <p className="text-xs text-muted-foreground mb-1">La recherche utilise les contours agricoles, les images satellite et le modèle HF avant d’afficher les parcelles d’orge.</p>
-      <p className="text-xs text-muted-foreground mb-3">Astuce : glissez ou touchez le repère vert sur la carte pour choisir un point, les coordonnées se remplissent automatiquement.</p>
+      <p className="text-xs text-muted-foreground mb-3">Astuce : glissez ou touchez le repère sur la carte pour choisir un point, les coordonnées se remplissent automatiquement.</p>
       <form onSubmit={handleSubmit} className="space-y-2">
         {locationError && <p className="text-xs text-destructive">{locationError}</p>}
         <Input
