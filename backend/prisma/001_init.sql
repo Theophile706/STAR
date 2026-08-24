@@ -10,6 +10,8 @@ CREATE TABLE IF NOT EXISTS parcelles (
   culture_declared text,
   culture_detected text,
   ndvi_percentage double precision,
+  ndre double precision,
+  spectral_bands jsonb,
   confidence double precision,
   verdict text,
   details text,

@@ -51,7 +51,7 @@ Services externes utilisés par le backend :
 Installez les dépendances du frontend et du backend :
 
 ```bash
-npm install
+npm --prefix frontend install
 npm --prefix backend install
 ```
 
@@ -82,7 +82,7 @@ Ne versionnez jamais les fichiers `.env` ni les clés de service. Utilisez exclu
 
 ### Frontend — `.env`
 
-Créez un fichier `.env` à la racine du projet :
+Créez le fichier `frontend/.env` :
 
 ```dotenv
 VITE_API_URL=http://localhost:3001
@@ -124,28 +124,24 @@ FRONTEND_ORIGIN=http://localhost:8080
 
 ```text
 .
-├── src/                         # Application frontend React
-│   ├── components/               # Composants métier et composants UI
-│   │   ├── SatelliteMap.tsx      # Carte, géolocalisation et interactions
-│   │   ├── PolygonDrawer.tsx     # Dessin de parcelles
-│   │   ├── AnalysisPopup.tsx     # Lancement et restitution de l’analyse
-│   │   └── ui/                   # Composants de base Radix / shadcn
-│   ├── hooks/
-│   │   └── useParcelles.ts       # Lecture, création et suppression via l’API
-│   ├── pages/
-│   │   ├── Index.tsx             # Carte satellite (`/`)
-│   │   ├── Dashboard.tsx         # Tableau de bord (`/dashboard`)
-│   │   └── NotFound.tsx          # Route de secours
-│   ├── lib/utils.ts              # Utilitaires frontend
-│   ├── App.tsx                   # Providers et routes React
-│   └── main.tsx                  # Point d’entrée React
-├── backend/                      # API TypeScript Fastify
+├── frontend/                    # Application React + Vite
+│   ├── src/                     # Code frontend React
+│   │   ├── components/          # Composants métier et composants UI
+│   │   ├── hooks/               # Hooks React
+│   │   ├── pages/               # Routes de l’application
+│   │   ├── lib/                 # Utilitaires frontend
+│   │   ├── App.tsx              # Providers et routes React
+│   │   └── main.tsx             # Point d’entrée React
+│   ├── index.html               # Document HTML Vite
+│   ├── vite.config.ts           # Configuration Vite et alias `@/`
+│   ├── tailwind.config.ts       # Thème Tailwind
+│   └── package.json             # Dépendances et scripts frontend
+├── backend/                     # API TypeScript Fastify
 │   ├── prisma/schema.prisma      # Modèle de données PostgreSQL
 │   ├── src/server.ts             # Serveur et routes REST
 │   └── src/analyze-parcel.ts     # Earth Engine, indices et classification
-├── tailwind.config.ts            # Thème et analyse Tailwind CSS
-├── vite.config.ts                # Configuration Vite et alias `@/`
-└── README.md                     # Documentation du projet
+├── package.json                 # Scripts racine qui relaient frontend/backend
+└── README.md                    # Documentation du projet
 ```
 
 ## API backend
@@ -199,8 +195,8 @@ Le modèle Prisma `Parcelle` est décrit dans `backend/prisma/schema.prisma`. Il
 
 ## Développement et vérifications
 
-- Utilisez l’alias `@/` pour les imports issus de `src/`.
-- Les composants métier sont dans `src/components/` ; conservez les composants génériques dans `src/components/ui/`.
+- Utilisez l’alias `@/` pour les imports issus de `frontend/src/`.
+- Les composants métier sont dans `frontend/src/components/` ; conservez les composants génériques dans `frontend/src/components/ui/`.
 - Toute évolution du schéma doit être faite dans `backend/prisma/schema.prisma`, suivie de `npm --prefix backend run prisma:generate`.
 - Exécutez `npm run lint`, `npm run test`, `npm run build` et `npm run backend:build` avant une livraison.
 - Vérifiez manuellement le parcours principal : chargement de la carte, tracé d’une parcelle, analyse, enregistrement et affichage dans le tableau de bord.

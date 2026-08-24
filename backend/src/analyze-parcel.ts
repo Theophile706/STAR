@@ -149,7 +149,7 @@ export async function analyzeParcel(req: Request): Promise<Response> {
   }
 }
 
-type LatLng = { lat: number; lng: number };
+export type LatLng = { lat: number; lng: number };
 
 type DetectedSegment = {
   coordinates: LatLng[];
@@ -164,7 +164,7 @@ type SegmentCandidate = {
   ndvi: number | null;
 };
 
-type GeeValue = {
+export type GeeValue = {
   constantValue?: unknown;
   valueReference?: string;
   functionInvocationValue?: {
@@ -185,11 +185,11 @@ const MAX_SEGMENT_AREA_M2 = 500_000;
 const MAX_SEGMENTS_TO_CLASSIFY = 12;
 const MIN_BARLEY_CONFIDENCE = 70;
 const TIME_SERIES_CONCURRENCY = 1;
-const GEE_COMPUTE_TIMEOUT_MS = 60_000;
+export const GEE_COMPUTE_TIMEOUT_MS = 60_000;
 const EXTERNAL_REQUEST_TIMEOUT_MS = 30_000;
 const RETRY_DELAYS_MS = [250, 1_000] as const;
 
-async function fetchWithRetry(input: string | URL, init: RequestInit, timeoutMs: number): Promise<Response> {
+export async function fetchWithRetry(input: string | URL, init: RequestInit, timeoutMs: number): Promise<Response> {
   let lastError: unknown = null;
   for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
     try {
@@ -272,7 +272,7 @@ async function detectBarleySegments(
   }
 }
 
-function isGeeFeatureCollection(value: unknown): value is { type: "FeatureCollection"; features: unknown[] } {
+export function isGeeFeatureCollection(value: unknown): value is { type: "FeatureCollection"; features: unknown[] } {
   return !!value
     && typeof value === "object"
     && (value as { type?: unknown }).type === "FeatureCollection"
@@ -410,7 +410,7 @@ function buildSNICVectorsExpression(_lat: number, _lng: number, polygon: unknown
   return { expression: { result: "vectors", values } };
 }
 
-function addSpectralIndex(image: GeeValue, name: string, bands: [string, string]): GeeValue {
+export function addSpectralIndex(image: GeeValue, name: string, bands: [string, string]): GeeValue {
   const index = geeCall("Image.rename", {
     input: geeCall("Image.normalizedDifference", {
       input: image,
@@ -421,7 +421,7 @@ function addSpectralIndex(image: GeeValue, name: string, bands: [string, string]
   return geeCall("Image.addBands", { dstImg: image, srcImg: index });
 }
 
-function addBareSoilIndex(image: GeeValue): GeeValue {
+export function addBareSoilIndex(image: GeeValue): GeeValue {
   const band = (name: string) => geeCall("Image.select", {
     input: image,
     bandSelectors: geeConstant([name]),
@@ -438,15 +438,15 @@ function addBareSoilIndex(image: GeeValue): GeeValue {
   });
 }
 
-function geeCall(functionName: string, arguments_: Record<string, GeeValue>): GeeValue {
+export function geeCall(functionName: string, arguments_: Record<string, GeeValue>): GeeValue {
   return { functionInvocationValue: { functionName, arguments: arguments_ } };
 }
 
-function geeConstant(value: unknown): GeeValue {
+export function geeConstant(value: unknown): GeeValue {
   return { constantValue: value };
 }
 
-function geeImageConstant(value: number): GeeValue {
+export function geeImageConstant(value: number): GeeValue {
   return geeCall("Image.constant", { value: geeConstant(value) });
 }
 
@@ -480,7 +480,7 @@ function polygonCoordinates(polygon: unknown): number[][][] {
   return [ring];
 }
 
-function extractLatLngFromGeometry(geometry: unknown): LatLng[] {
+export function extractLatLngFromGeometry(geometry: unknown): LatLng[] {
   if (!geometry || typeof geometry !== "object") return [];
   const value = geometry as { type?: unknown; coordinates?: unknown };
   const ring = value.type === "Polygon" && Array.isArray(value.coordinates)
@@ -497,7 +497,7 @@ function extractLatLngFromGeometry(geometry: unknown): LatLng[] {
     : []);
 }
 
-function approximatePolygonAreaM2(coords: LatLng[]): number {
+export function approximatePolygonAreaM2(coords: LatLng[]): number {
   if (coords.length < 3) return 0;
   const centroid = polygonCentroid(coords);
   const latFactor = 111_320;
@@ -525,7 +525,7 @@ function segmentZoomForArea(areaM2: number, latitude: number, fallbackZoom: numb
   return Math.max(fallbackZoom, Math.min(20, zoom));
 }
 
-async function getGeeAccessToken(): Promise<string> {
+export async function getGeeAccessToken(): Promise<string> {
   const serviceAccountJson = process.env.GEE_SERVICE_ACCOUNT_KEY;
   if (!serviceAccountJson) throw new Error("GEE_SERVICE_ACCOUNT_KEY is not configured");
 
@@ -809,7 +809,7 @@ async function callGeeCompute(accessToken: string, projectId: string, expression
 }
 
 // Variant that returns the raw compute response (useful for vector outputs)
-async function callGeeComputeRaw(accessToken: string, projectId: string, expression: unknown): Promise<Record<string, unknown>> {
+export async function callGeeComputeRaw(accessToken: string, projectId: string, expression: unknown): Promise<Record<string, unknown>> {
   const url = `https://earthengine.googleapis.com/v1/projects/${projectId}/value:compute`;
   const resp = await fetchWithRetry(url, {
     method: "POST",
@@ -1275,7 +1275,7 @@ function computeHybridScore(cnnConfidence: number, cnnIsBarley: boolean, agroSco
 
 // ── HuggingFace Model Integration ──
 
-async function captureParcelImage(lat: number, lng: number, zoom: number, polygon?: unknown): Promise<string> {
+export async function captureParcelImage(lat: number, lng: number, zoom: number, polygon?: unknown): Promise<string> {
   if (!GOOGLE_MAPS_API_KEY || GOOGLE_MAPS_API_KEY.startsWith("VOTRE_")) {
     throw new Error("GOOGLE_MAPS_API_KEY n’est pas configurée.");
   }
@@ -1307,7 +1307,7 @@ async function captureParcelImage(lat: number, lng: number, zoom: number, polygo
   return btoa(binary);
 }
 
-interface HFModelResult {
+export interface HFModelResult {
   is_barley: boolean;
   confidence: number;
   prob_barley: number;
@@ -1334,7 +1334,7 @@ function createUnavailableHybridScore(): ReturnType<typeof computeHybridScore> {
   };
 }
 
-async function callHFModel(satelliteImageBase64: string): Promise<HFModelResult> {
+export async function callHFModel(satelliteImageBase64: string): Promise<HFModelResult> {
   console.log("Calling HF model /predict at:", HF_MODEL_URL);
 
   const binaryStr = atob(satelliteImageBase64);
