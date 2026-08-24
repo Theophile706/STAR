@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { GoogleMap, useJsApiLoader } from "@react-google-maps/api";
 import AutomaticParcelOverlays from "./AutomaticParcelOverlays";
+import SimpleFieldOverlays from "./SimpleFieldOverlays";
 import CoordinateInput from "./CoordinateInput";
 import ParcelOverlays from "./ParcelOverlays";
 import PolygonDrawer from "./PolygonDrawer";
@@ -8,6 +9,7 @@ import AnalysisPopup from "./AnalysisPopup";
 import { useNavigate } from "react-router-dom";
 import { BarChart3 } from "lucide-react";
 import { getDetectedBarleySegments, searchAutomaticParcels, type AutomaticParcelSearchResult } from "@/lib/automatic-parcels";
+import { runSimpleAnalysis, type SimpleAnalysisResult } from "@/lib/barley-detect-simple";
 import type { BarleyDetectionConfig } from "@/lib/barley-detection";
 import { useParcelles } from "@/hooks/useParcelles";
 
@@ -49,6 +51,9 @@ export default function SatelliteMap() {
   const [searchResult, setSearchResult] = useState<AutomaticParcelSearchResult | null>(null);
   const [isSearching, setIsSearching] = useState(false);
   const [searchError, setSearchError] = useState("");
+  const [simpleResult, setSimpleResult] = useState<SimpleAnalysisResult | null>(null);
+  const [isSearchingSimple, setIsSearchingSimple] = useState(false);
+  const [simpleSearchError, setSimpleSearchError] = useState("");
   const [drawnParcel, setDrawnParcel] = useState<DrawnParcel | null>(null);
   const navigate = useNavigate();
   const { parcelles, addParcelle } = useParcelles();
@@ -170,6 +175,20 @@ export default function SatelliteMap() {
     }
   }, []);
 
+  const handleSimpleSearch = useCallback(async (lat: number, lng: number, radiusM: number) => {
+    setIsSearchingSimple(true);
+    setSimpleSearchError("");
+    setSimpleResult(null);
+    try {
+      const result = await runSimpleAnalysis(lat, lng, radiusM);
+      setSimpleResult(result);
+    } catch (error) {
+      setSimpleSearchError(error instanceof Error ? error.message : "L'analyse simple a échoué.");
+    } finally {
+      setIsSearchingSimple(false);
+    }
+  }, []);
+
   const handlePolygonComplete = useCallback((points: Array<{ lat: number; lng: number }>, ownerName: string, notes: string) => {
     const map = mapRef.current;
     if (!map) return;
@@ -254,6 +273,9 @@ export default function SatelliteMap() {
       {/* Parcels discovered from the GPS search */}
       <AutomaticParcelOverlays map={mapRef.current} parcels={searchResult?.parcels ?? []} />
 
+      {/* Orge détectée par la pipeline simple (Sentinel-2, sans SNIC) */}
+      <SimpleFieldOverlays map={mapRef.current} result={simpleResult} />
+
       <PolygonDrawer map={mapRef.current} onPolygonComplete={handlePolygonComplete} />
 
       {drawnParcel && (
@@ -276,6 +298,10 @@ export default function SatelliteMap() {
         search={searchResult}
         isSearching={isSearching}
         searchError={searchError}
+        onSearchSimple={handleSimpleSearch}
+        simpleResult={simpleResult}
+        isSearchingSimple={isSearchingSimple}
+        simpleSearchError={simpleSearchError}
         pickedLocation={pickedLocation}
       />
 

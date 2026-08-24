@@ -6,6 +6,7 @@ import { Prisma, PrismaClient } from "@prisma/client";
 import { z } from "zod";
 import { analyzeParcel } from "./analyze-parcel.js";
 import { detectAutomaticParcels } from "./automatic-parcels.js";
+import { analyzeFieldsSimple } from "./barley-detect-simple.js";
 
 const app = Fastify({ logger: true });
 const prisma = new PrismaClient();
@@ -63,6 +64,13 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
 }
 
 const pointSchema = z.object({ lat: z.number(), lng: z.number() });
+const analyzeSimpleSchema = z.object({
+  latitude: z.number().finite().min(-90).max(90),
+  longitude: z.number().finite().min(-180).max(180),
+  radius: z.number().finite().min(50).max(20_000),
+  confidenceThreshold: z.number().finite().min(0.5).max(0.95).optional(),
+  minAreaHa: z.number().finite().min(0.01).max(5).optional(),
+});
 const automaticDetectionSchema = z.object({
   lat: z.number().finite().min(-90).max(90),
   lng: z.number().finite().min(-180).max(180),
@@ -200,6 +208,65 @@ app.post("/api/detect-parcels", async (request, reply) => {
     };
     return reply.send(fallback);
   }
+});
+
+const FIELD_SCAN_VERSION = "v1-simple";
+const FIELD_SCAN_PROXIMITY_DEGREES = 0.01; // ~1 km, tolérance pour retrouver "la même zone"
+
+app.post("/api/analyze", async (request, reply) => {
+  const parsed = analyzeSimpleSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: "Coordonnées ou rayon invalides.", details: parsed.error.flatten() });
+
+  const { latitude, longitude, radius, confidenceThreshold, minAreaHa } = parsed.data;
+  const result = await analyzeFieldsSimple({ lat: latitude, lng: longitude, radiusM: radius, confidenceThreshold, minAreaHa });
+
+  // La persistance ne doit jamais faire perdre une analyse déjà calculée (appels GEE + CNN coûteux) :
+  // un incident DB transitoire devient un avertissement, pas un 500 qui jette tout le résultat.
+  try {
+    const run = await prisma.fieldScanRun.create({
+      data: {
+        version: FIELD_SCAN_VERSION,
+        center_lat: latitude,
+        center_lng: longitude,
+        radius_m: radius,
+        image_date: result.imageDate,
+        image_age_days: result.imageAgeDays,
+        cloud_percentage: result.cloudPercentage,
+        confidence_threshold: result.confidenceThreshold,
+        min_area_ha: result.minAreaHa,
+        result_geojson: jsonValue(result),
+        candidates_found: result.candidatesFound,
+        candidates_kept: result.candidatesClassified,
+        warnings: jsonValue(result.warnings),
+      },
+    });
+    return reply.send({ analysisId: run.id, analysisDate: run.created_at, ...result });
+  } catch (error) {
+    app.log.warn({ err: error }, "analyze: persistence failed, returning result without analysisId");
+    result.warnings.push("Résultat non sauvegardé : la base de données est temporairement indisponible.");
+    return reply.send({ analysisId: null, analysisDate: new Date().toISOString(), ...result });
+  }
+});
+
+app.get("/api/analyze/latest", async (request, reply) => {
+  const query = z.object({
+    lat: z.coerce.number().finite().min(-90).max(90),
+    lng: z.coerce.number().finite().min(-180).max(180),
+  }).safeParse(request.query);
+  if (!query.success) return reply.code(400).send({ error: "Coordonnées invalides.", details: query.error.flatten() });
+
+  const { lat, lng } = query.data;
+  const run = await prisma.fieldScanRun.findFirst({
+    where: {
+      version: FIELD_SCAN_VERSION,
+      center_lat: { gte: lat - FIELD_SCAN_PROXIMITY_DEGREES, lte: lat + FIELD_SCAN_PROXIMITY_DEGREES },
+      center_lng: { gte: lng - FIELD_SCAN_PROXIMITY_DEGREES, lte: lng + FIELD_SCAN_PROXIMITY_DEGREES },
+    },
+    orderBy: { created_at: "desc" },
+  });
+  if (!run) return reply.code(404).send({ error: "Aucune analyse enregistrée pour cette zone." });
+
+  return reply.send({ analysisId: run.id, analysisDate: run.created_at, ...(run.result_geojson as Record<string, unknown>) });
 });
 
 const port = Number(process.env.PORT ?? 3001);

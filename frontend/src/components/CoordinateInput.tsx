@@ -3,7 +3,8 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { DEFAULT_BARLEY_DETECTION_CONFIG, type BarleyDetectionConfig } from "@/lib/barley-detection";
 import { getDetectedBarleySegments, type AutomaticParcelSearchResult } from "@/lib/automatic-parcels";
-import { LocateFixed, MapPinned, Navigation, Radar, ThermometerSun } from "lucide-react";
+import type { SimpleAnalysisResult } from "@/lib/barley-detect-simple";
+import { LocateFixed, MapPinned, Navigation, Radar, Satellite, ThermometerSun } from "lucide-react";
 
 interface CoordinateInputProps {
   onNavigate: (lat: number, lng: number, radiusKm: number) => void;
@@ -11,10 +12,18 @@ interface CoordinateInputProps {
   search: AutomaticParcelSearchResult | null;
   isSearching: boolean;
   searchError: string;
+  onSearchSimple: (lat: number, lng: number, radiusKm: number) => Promise<void>;
+  simpleResult: SimpleAnalysisResult | null;
+  isSearchingSimple: boolean;
+  simpleSearchError: string;
   pickedLocation: { lat: number; lng: number } | null;
 }
 
-export default function CoordinateInput({ onNavigate, onSearch, search, isSearching, searchError, pickedLocation }: CoordinateInputProps) {
+export default function CoordinateInput({
+  onNavigate, onSearch, search, isSearching, searchError,
+  onSearchSimple, simpleResult, isSearchingSimple, simpleSearchError,
+  pickedLocation,
+}: CoordinateInputProps) {
   const [lat, setLat] = useState("");
   const [lng, setLng] = useState("");
   const [radiusValue, setRadiusValue] = useState("10");
@@ -100,6 +109,26 @@ export default function CoordinateInput({ onNavigate, onSearch, search, isSearch
     setValidationError("");
     onNavigate(latNum, lngNum, radiusNum);
     await onSearch(latNum, lngNum, radiusNum, config);
+  };
+
+  const handleSimpleSearch = async () => {
+    const latNum = Number(lat);
+    const lngNum = Number(lng);
+    const radiusInput = Number(radiusValue);
+    const radiusNum = radiusUnit === "m" ? radiusInput / 1000 : radiusInput;
+
+    if (!Number.isFinite(latNum) || latNum < -90 || latNum > 90 || !Number.isFinite(lngNum) || lngNum < -180 || lngNum > 180) {
+      setValidationError("Saisissez une latitude et une longitude valides.");
+      return;
+    }
+    if (!Number.isFinite(radiusInput) || radiusInput <= 0 || !Number.isFinite(radiusNum) || radiusNum < 0.05 || radiusNum > 20) {
+      setValidationError("Le rayon doit être compris entre 50 m et 20 km.");
+      return;
+    }
+
+    setValidationError("");
+    onNavigate(latNum, lngNum, radiusNum);
+    await onSearchSimple(latNum, lngNum, radiusNum * 1000);
   };
 
   if (!expanded) {
@@ -199,7 +228,50 @@ export default function CoordinateInput({ onNavigate, onSearch, search, isSearch
             : <Navigation key="icon" className="w-4 h-4" />}
           <span key="label">{isSearching ? "Analyse HF + satellite..." : "Lancer l’analyse automatique"}</span>
         </Button>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          className="w-full gap-2"
+          disabled={isSearchingSimple}
+          onClick={handleSimpleSearch}
+        >
+          {isSearchingSimple
+            ? <span key="icon" className="w-3.5 h-3.5 rounded-full border-2 border-primary/40 border-t-primary animate-spin" />
+            : <Satellite key="icon" className="w-4 h-4" />}
+          <span key="label">{isSearchingSimple ? "Analyse Sentinel-2 en cours..." : "Analyse simple (Sentinel-2, sans SNIC)"}</span>
+        </Button>
       </form>
+      {simpleSearchError && <p className="mt-2 text-xs text-destructive">{simpleSearchError}</p>}
+      {simpleResult && (
+        <div className="mt-3 rounded-lg border border-cyan-400/60 bg-cyan-400/10 p-3 space-y-2">
+          <div className="flex items-center justify-between">
+            <p className="text-sm font-semibold text-foreground">Analyse simple (Version A)</p>
+            <span className="text-xs font-mono text-muted-foreground">{(simpleResult.radiusM / 1000).toFixed(2)} km</span>
+          </div>
+          <div className="grid grid-cols-2 gap-2 text-center">
+            <div className="rounded-md bg-background/60 p-2">
+              <p className="text-lg font-semibold text-foreground">{simpleResult.candidatesFound}</p>
+              <p className="text-[10px] text-muted-foreground">candidats</p>
+            </div>
+            <div className="rounded-md bg-cyan-300/30 p-2">
+              <p className="text-lg font-semibold text-cyan-700">{simpleResult.features.length}</p>
+              <p className="text-[10px] text-cyan-800">orge détectée</p>
+            </div>
+          </div>
+          <p className="text-[11px] text-muted-foreground">
+            Image Sentinel-2 : {simpleResult.imageDate ?? "—"} ({simpleResult.imageAgeDays ?? "?"} j) · nuages {simpleResult.cloudPercentage ?? "?"}% · seuil de confiance {Math.round(simpleResult.confidenceThreshold * 100)}%
+          </p>
+          {simpleResult.warnings.length > 0 && (
+            <div className="rounded-md bg-amber-100/80 px-2 py-1.5 space-y-0.5">
+              {simpleResult.warnings.map((warning, index) => (
+                <p key={index} className="text-[11px] text-amber-900">{warning}</p>
+              ))}
+            </div>
+          )}
+          <p className="text-[11px] text-cyan-800">Cyan : masque pixel Sentinel-2 (NDVI/NDRE) + modèle HF, sans SNIC.</p>
+        </div>
+      )}
       {search && (
         <div className="mt-3 rounded-lg border border-border bg-muted/40 p-3 space-y-2">
           <div className="flex items-center justify-between">

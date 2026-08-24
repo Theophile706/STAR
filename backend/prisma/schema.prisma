@@ -47,3 +47,23 @@ model Parcelle {
 
   @@map("parcelles")
 }
+
+model FieldScanRun {
+  id                    String   @id @default(uuid()) @db.Uuid
+  version               String
+  center_lat            Float
+  center_lng            Float
+  radius_m              Float
+  image_date            String?
+  image_age_days        Int?
+  cloud_percentage      Float?
+  confidence_threshold  Float
+  min_area_ha           Float
+  result_geojson        Json
+  candidates_found      Int
+  candidates_kept       Int
+  warnings              Json
+  created_at            DateTime @default(now()) @db.Timestamptz(6)
+
+  @@map("field_scan_runs")
+}

@@ -149,7 +149,7 @@ export async function analyzeParcel(req: Request): Promise<Response> {
   }
 }
 
-type LatLng = { lat: number; lng: number };
+export type LatLng = { lat: number; lng: number };
 
 type DetectedSegment = {
   coordinates: LatLng[];
@@ -1275,7 +1275,7 @@ function computeHybridScore(cnnConfidence: number, cnnIsBarley: boolean, agroSco
 
 // ── HuggingFace Model Integration ──
 
-async function captureParcelImage(lat: number, lng: number, zoom: number, polygon?: unknown): Promise<string> {
+export async function captureParcelImage(lat: number, lng: number, zoom: number, polygon?: unknown): Promise<string> {
   if (!GOOGLE_MAPS_API_KEY || GOOGLE_MAPS_API_KEY.startsWith("VOTRE_")) {
     throw new Error("GOOGLE_MAPS_API_KEY n’est pas configurée.");
   }
@@ -1307,7 +1307,7 @@ async function captureParcelImage(lat: number, lng: number, zoom: number, polygo
   return btoa(binary);
 }
 
-interface HFModelResult {
+export interface HFModelResult {
   is_barley: boolean;
   confidence: number;
   prob_barley: number;
@@ -1334,7 +1334,7 @@ function createUnavailableHybridScore(): ReturnType<typeof computeHybridScore> {
   };
 }
 
-async function callHFModel(satelliteImageBase64: string): Promise<HFModelResult> {
+export async function callHFModel(satelliteImageBase64: string): Promise<HFModelResult> {
   console.log("Calling HF model /predict at:", HF_MODEL_URL);
 
   const binaryStr = atob(satelliteImageBase64);
