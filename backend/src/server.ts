@@ -4,9 +4,17 @@ import Fastify from "fastify";
 import cors from "@fastify/cors";
 import { Prisma, PrismaClient } from "@prisma/client";
 import { z } from "zod";
-import { analyzeParcel } from "./analyze-parcel.js";
+import { analyzeParcel, getGeeAccessToken, getGeeProjectId } from "./analyze-parcel.js";
 import { detectAutomaticParcels } from "./automatic-parcels.js";
-import { analyzeFieldsSimple } from "./barley-detect-simple.js";
+import { analyzeFieldsSimple, saveSimpleFieldParcelles } from "./barley-detect-simple.js";
+import { fetchSentinel2TilePng } from "./sentinel-tiles.js";
+
+// PNG transparent 1x1, servi quand une tuile Sentinel-2 n'est pas disponible (tuile hors
+// empreinte de la scène, image manquante) pour éviter une icône "image cassée" côté carte.
+const TRANSPARENT_PNG = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+  "base64",
+);
 
 const app = Fastify({ logger: true });
 const prisma = new PrismaClient();
@@ -220,6 +228,14 @@ app.post("/api/analyze", async (request, reply) => {
   const { latitude, longitude, radius, confidenceThreshold, minAreaHa } = parsed.data;
   const result = await analyzeFieldsSimple({ lat: latitude, lng: longitude, radiusM: radius, confidenceThreshold, minAreaHa });
 
+  // Enregistre chaque parcelle ORGE détectée dans le registre (table `parcelles`), sinon elle
+  // ne survit qu'en mémoire côté frontend et disparaît au rechargement / n'apparaît jamais dans
+  // le tableau de bord. Best-effort : un échec ne doit pas faire perdre le résultat déjà calculé.
+  if (result.features.length > 0) {
+    await saveSimpleFieldParcelles(result.features, result.warnings);
+    parcellesCache = null;
+  }
+
   // La persistance ne doit jamais faire perdre une analyse déjà calculée (appels GEE + CNN coûteux) :
   // un incident DB transitoire devient un avertissement, pas un 500 qui jette tout le résultat.
   try {
@@ -267,6 +283,36 @@ app.get("/api/analyze/latest", async (request, reply) => {
   if (!run) return reply.code(404).send({ error: "Aucune analyse enregistrée pour cette zone." });
 
   return reply.send({ analysisId: run.id, analysisDate: run.created_at, ...(run.result_geojson as Record<string, unknown>) });
+});
+
+const sentinelTileParamsSchema = z.object({
+  z: z.coerce.number().int().min(10).max(19),
+  x: z.coerce.number().int().min(0),
+  y: z.coerce.number().int().min(0),
+});
+const sentinelTileQuerySchema = z.object({
+  imageTimestampMs: z.coerce.number().finite().positive(),
+});
+
+app.get("/api/sentinel-tiles/:z/:x/:y", async (request, reply) => {
+  const params = sentinelTileParamsSchema.safeParse(request.params);
+  const query = sentinelTileQuerySchema.safeParse(request.query);
+  if (!params.success || !query.success) {
+    return reply.code(400).send({ error: "Coordonnées de tuile ou timestamp d'image invalides." });
+  }
+
+  try {
+    const accessToken = await getGeeAccessToken();
+    const projectId = getGeeProjectId();
+    const pngBytes = await fetchSentinel2TilePng(accessToken, projectId, params.data, query.data.imageTimestampMs);
+    reply.header("Cache-Control", "public, max-age=3600");
+    if (!pngBytes) return reply.type("image/png").send(TRANSPARENT_PNG);
+    return reply.type("image/png").send(Buffer.from(pngBytes));
+  } catch (error) {
+    app.log.warn({ err: error }, "sentinel-tiles: tuile indisponible");
+    reply.header("Cache-Control", "public, max-age=60");
+    return reply.type("image/png").send(TRANSPARENT_PNG);
+  }
 });
 
 const port = Number(process.env.PORT ?? 3001);

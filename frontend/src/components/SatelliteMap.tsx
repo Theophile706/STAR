@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { GoogleMap, useJsApiLoader } from "@react-google-maps/api";
 import AutomaticParcelOverlays from "./AutomaticParcelOverlays";
 import SimpleFieldOverlays from "./SimpleFieldOverlays";
+import Sentinel2TileLayer from "./Sentinel2TileLayer";
 import CoordinateInput from "./CoordinateInput";
 import ParcelOverlays from "./ParcelOverlays";
 import PolygonDrawer from "./PolygonDrawer";
@@ -173,15 +174,15 @@ export default function SatelliteMap() {
     }
   }, []);
 
-  const handleSimpleSearch = useCallback(async (lat: number, lng: number, radiusM: number) => {
+  const handleSimpleSearch = useCallback(async (lat: number, lng: number, radiusM: number, confidenceThreshold: number) => {
     setIsSearchingSimple(true);
     setSimpleSearchError("");
     setSimpleResult(null);
     try {
-      const result = await runSimpleAnalysis(lat, lng, radiusM);
+      const result = await runSimpleAnalysis(lat, lng, radiusM, { confidenceThreshold });
       setSimpleResult(result);
     } catch (error) {
-      setSimpleSearchError(error instanceof Error ? error.message : "L'analyse simple a échoué.");
+      setSimpleSearchError(error instanceof Error ? error.message : "L'analyse Sentinel-2 a échoué.");
     } finally {
       setIsSearchingSimple(false);
     }
@@ -249,7 +250,7 @@ export default function SatelliteMap() {
               <div className="absolute inset-0 rounded-full border-2 border-primary border-t-transparent animate-spin" />
             </div>
             <span className="text-foreground font-medium">Localisation en cours...</span>
-            <span className="text-muted-foreground text-sm">Chargement de l'imagerie satellite</span>
+            <span className="text-muted-foreground text-sm">Chargement de la carte</span>
           </div>
         </div>
       )}
@@ -265,13 +266,18 @@ export default function SatelliteMap() {
         </div>
       </div>
 
+      {/* Fond Sentinel-2 : uniquement l'image exacte de l'analyse en cours, sur la zone recherchée (pas de fond permanent) */}
+      {simpleResult?.imageTimestampMs != null && (
+        <Sentinel2TileLayer map={mapRef.current} imageTimestampMs={simpleResult.imageTimestampMs} />
+      )}
+
       {/* Parcelles enregistrées dans la base de données */}
       <ParcelOverlays map={mapRef.current} parcelles={parcelles} />
 
       {/* Parcels discovered from the GPS search */}
       <AutomaticParcelOverlays map={mapRef.current} parcels={searchResult?.parcels ?? []} />
 
-      {/* Orge détectée par la pipeline simple (Sentinel-2, sans SNIC) */}
+      {/* Orge détectée par la pipeline Sentinel-2 (segmentation SNIC) */}
       <SimpleFieldOverlays map={mapRef.current} result={simpleResult} />
 
       <PolygonDrawer map={mapRef.current} onPolygonComplete={handlePolygonComplete} />

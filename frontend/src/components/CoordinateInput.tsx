@@ -12,7 +12,7 @@ interface CoordinateInputProps {
   search: AutomaticParcelSearchResult | null;
   isSearching: boolean;
   searchError: string;
-  onSearchSimple: (lat: number, lng: number, radiusKm: number) => Promise<void>;
+  onSearchSimple: (lat: number, lng: number, radiusKm: number, confidenceThreshold: number) => Promise<void>;
   simpleResult: SimpleAnalysisResult | null;
   isSearchingSimple: boolean;
   simpleSearchError: string;
@@ -31,6 +31,7 @@ export default function CoordinateInput({
   const [baseTemperature, setBaseTemperature] = useState(String(DEFAULT_BARLEY_DETECTION_CONFIG.baseTemperature));
   const [threshold, setThreshold] = useState(String(DEFAULT_BARLEY_DETECTION_CONFIG.threshold));
   const [periodDays, setPeriodDays] = useState("130");
+  const [simpleConfidencePercent, setSimpleConfidencePercent] = useState("70");
   const [expanded, setExpanded] = useState(true);
   const [validationError, setValidationError] = useState("");
   const [isLocating, setIsLocating] = useState(false);
@@ -125,10 +126,15 @@ export default function CoordinateInput({
       setValidationError("Le rayon doit être compris entre 50 m et 20 km.");
       return;
     }
+    const confidencePercentNum = Number(simpleConfidencePercent);
+    if (!Number.isFinite(confidencePercentNum) || confidencePercentNum < 50 || confidencePercentNum > 95) {
+      setValidationError("Le seuil de confiance doit être compris entre 50 % et 95 %.");
+      return;
+    }
 
     setValidationError("");
     onNavigate(latNum, lngNum, radiusNum);
-    await onSearchSimple(latNum, lngNum, radiusNum * 1000);
+    await onSearchSimple(latNum, lngNum, radiusNum * 1000, confidencePercentNum / 100);
   };
 
   if (!expanded) {
@@ -228,6 +234,19 @@ export default function CoordinateInput({
             : <Navigation key="icon" className="w-4 h-4" />}
           <span key="label">{isSearching ? "Analyse HF + satellite..." : "Lancer l’analyse automatique"}</span>
         </Button>
+        <label className="block text-[11px] text-muted-foreground">
+          Seuil de confiance Sentinel-2 (%)
+          <Input
+            type="number"
+            min="50"
+            max="95"
+            step="1"
+            value={simpleConfidencePercent}
+            onChange={(e) => setSimpleConfidencePercent(e.target.value)}
+            className="mt-1 h-8 text-xs bg-background/70"
+          />
+          <span className="mt-1 block text-[10px]">Seules les parcelles classées orge avec au moins cette confiance sont affichées · 50 % à 95 %</span>
+        </label>
         <Button
           type="button"
           variant="outline"
@@ -239,14 +258,14 @@ export default function CoordinateInput({
           {isSearchingSimple
             ? <span key="icon" className="w-3.5 h-3.5 rounded-full border-2 border-primary/40 border-t-primary animate-spin" />
             : <Satellite key="icon" className="w-4 h-4" />}
-          <span key="label">{isSearchingSimple ? "Analyse Sentinel-2 en cours..." : "Analyse simple (Sentinel-2, sans SNIC)"}</span>
+          <span key="label">{isSearchingSimple ? "Analyse Sentinel-2 en cours..." : "Analyse Sentinel-2 (segmentation SNIC)"}</span>
         </Button>
       </form>
       {simpleSearchError && <p className="mt-2 text-xs text-destructive">{simpleSearchError}</p>}
       {simpleResult && (
         <div className="mt-3 rounded-lg border border-cyan-400/60 bg-cyan-400/10 p-3 space-y-2">
           <div className="flex items-center justify-between">
-            <p className="text-sm font-semibold text-foreground">Analyse simple (Version A)</p>
+            <p className="text-sm font-semibold text-foreground">Analyse Sentinel-2</p>
             <span className="text-xs font-mono text-muted-foreground">{(simpleResult.radiusM / 1000).toFixed(2)} km</span>
           </div>
           <div className="grid grid-cols-2 gap-2 text-center">
@@ -269,7 +288,7 @@ export default function CoordinateInput({
               ))}
             </div>
           )}
-          <p className="text-[11px] text-cyan-800">Cyan : masque pixel Sentinel-2 (NDVI/NDRE) + modèle HF, sans SNIC.</p>
+          <p className="text-[11px] text-cyan-800">Cyan : segmentation SNIC Sentinel-2 (NDVI/NDRE) + modèle HF. Le fond de carte affiche l'image Sentinel-2 exacte utilisée, uniquement sur cette zone.</p>
         </div>
       )}
       {search && (

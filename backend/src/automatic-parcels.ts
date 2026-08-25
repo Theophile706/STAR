@@ -11,6 +11,7 @@ import {
   geeImageConstant,
   GEE_COMPUTE_TIMEOUT_MS,
   getGeeAccessToken,
+  getGeeProjectId,
   isGeeFeatureCollection,
   type GeeValue,
 } from "./analyze-parcel.js";
@@ -337,6 +338,7 @@ async function discoverAgriculturalParcelsFromWatershed(
 
     const areaM2 = approximatePolygonAreaM2(coordinates);
     if (areaM2 < WATERSHED_MIN_SEGMENT_AREA_M2 || areaM2 > WATERSHED_MAX_SEGMENT_AREA_M2) continue;
+    if (!isPlausibleFieldShape(coordinates, areaM2)) continue;
 
     index++;
     candidates.push({
@@ -692,19 +694,6 @@ async function discoverAgriculturalParcelsFromSegmentation(
 
 // ── Segmentation GEE/SNIC (sans modèle ML) ──
 
-function getGeeProjectId(): string {
-  const serviceAccountJson = process.env.GEE_SERVICE_ACCOUNT_KEY;
-  if (!serviceAccountJson) return "earthengine-legacy";
-  try {
-    const serviceAccount = JSON.parse(serviceAccountJson) as { project_id?: unknown };
-    return typeof serviceAccount.project_id === "string" && serviceAccount.project_id.length > 0
-      ? serviceAccount.project_id
-      : "earthengine-legacy";
-  } catch {
-    return "earthengine-legacy";
-  }
-}
-
 /** Approxime un disque de rayon radiusKm autour de (lat,lng) par un polygone à N côtés. */
 function circleRegionCoordinates(lat: number, lng: number, radiusKm: number, vertices = CIRCLE_REGION_VERTICES): number[][][] {
   const latRad = (lat * Math.PI) / 180;
@@ -850,6 +839,7 @@ async function discoverAgriculturalParcelsFromGeeSegmentation(
 
     const areaM2 = approximatePolygonAreaM2(coordinates);
     if (areaM2 < MIN_PARCEL_SEGMENT_AREA_M2 || areaM2 > MAX_PARCEL_SEGMENT_AREA_M2) return [];
+    if (!isPlausibleFieldShape(coordinates, areaM2)) return [];
 
     const props = properties && typeof properties === "object" ? properties as Record<string, unknown> : {};
     const ndvi = typeof props.NDVI === "number" ? props.NDVI : undefined;
@@ -994,6 +984,37 @@ function polygonCenter(points: Array<{ lat: number; lng: number }>): { lat: numb
     lat: points.reduce((sum, point) => sum + point.lat, 0) / points.length,
     lng: points.reduce((sum, point) => sum + point.lng, 0) / points.length,
   };
+}
+
+function polygonPerimeterM(coords: Array<{ lat: number; lng: number }>): number {
+  const centroid = polygonCenter(coords);
+  const latFactor = 111_320;
+  const lngFactor = 111_320 * Math.cos((centroid.lat * Math.PI) / 180);
+  const points = coords.map((point) => ({
+    x: (point.lng - centroid.lng) * lngFactor,
+    y: (point.lat - centroid.lat) * latFactor,
+  }));
+  let perimeter = 0;
+  for (let i = 0; i < points.length; i++) {
+    const next = (i + 1) % points.length;
+    perimeter += Math.hypot(points[next].x - points[i].x, points[next].y - points[i].y);
+  }
+  return perimeter;
+}
+
+// Indice de compacité de Polsby-Popper (4π·aire/périmètre²) : 1 = cercle parfait, proche de 0 =
+// forme très découpée/allongée. Watershed et SNIC peuvent sous-segmenter (plusieurs champs, routes
+// et rivières fusionnés en un seul "bassin") quand le gradient NDVI interne est trop faible pour
+// bien séparer les parcelles réelles ; ce bassin fusionné a un contour très irrégulier (suit les
+// routes/rivières) et donc une compacité bien plus basse qu'un vrai champ, même de forme imparfaite.
+// Seuil de départ empirique (pas une vérité agronomique figée), à affiner avec des cas réels.
+const MIN_FIELD_COMPACTNESS = 0.12;
+
+function isPlausibleFieldShape(coords: Array<{ lat: number; lng: number }>, areaM2: number): boolean {
+  const perimeterM = polygonPerimeterM(coords);
+  if (perimeterM <= 0) return false;
+  const compactness = (4 * Math.PI * areaM2) / (perimeterM * perimeterM);
+  return compactness >= MIN_FIELD_COMPACTNESS;
 }
 
 function offsetPoint(center: { lat: number; lng: number }, eastKm: number, northKm: number): { lat: number; lng: number } {
