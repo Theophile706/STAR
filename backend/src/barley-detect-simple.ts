@@ -3,22 +3,29 @@ import {
   approximatePolygonAreaM2,
   callGeeComputeRaw,
   callHFModel,
-  captureParcelImage,
+  captureSentinel2ParcelImage,
   extractLatLngFromGeometry,
   geeCall,
   geeConstant,
   geeImageConstant,
   getGeeAccessToken,
   isGeeFeatureCollection,
+  SNIC_PARAMETERS,
   type GeeValue,
   type LatLng,
 } from "./analyze-parcel.js";
+import { Prisma, PrismaClient } from "@prisma/client";
 
-// ── Pipeline "Version A" : Sentinel-2 L2A + NDVI/NDRE + CNN externe existant, sans SNIC ──
-// Voir /home/tiavina/.claude/plans/recursive-sleeping-goblet.md pour le contexte complet.
-// Contrairement à automatic-parcels.ts (SNIC/watershed), la vectorisation se fait directement
-// sur un masque pixel (plausibilité spectrale + nettoyage des groupes isolés), sans segmentation
-// intermédiaire. Réservé pour comparaison future avec la "Version B" (SNIC).
+const prisma = new PrismaClient();
+
+// ── Pipeline "Version A" : Sentinel-2 L2A + NDVI/NDRE + segmentation SNIC + CNN externe existant ──
+// Voir /home/tiavina/.claude/plans/recursive-sleeping-goblet.md et
+// /home/tiavina/.claude/plans/warm-rolling-riddle.md pour le contexte complet.
+// Flux principal exposé côté UI : GPS+rayon -> GEE -> Sentinel-2 L2A -> sélection de la
+// meilleure image + masque nuage/ombre (SCL) -> bandes/NDVI/NDRE -> segmentation SNIC des
+// zones végétatives plausibles -> classification CNN (image Sentinel-2, pas Google Static
+// Maps) -> GeoJSON des parcelles ORGE. La "Version B" (automatic-parcels.ts, cascade
+// Overpass/DB/watershed/SNIC/Google Static Maps) reste inchangée pour comparaison.
 
 const MAX_IMAGE_AGE_DAYS_PRIMARY = 5;
 const MAX_IMAGE_AGE_DAYS_FALLBACK = 10;
@@ -72,6 +79,8 @@ export interface SimpleAnalysisResult {
   imageDate: string | null;
   imageAgeDays: number | null;
   cloudPercentage: number | null;
+  /** Timestamp exact (ms) de l'image Sentinel-2 analysée — sert de clé à /api/sentinel-tiles pour afficher le même fond de carte. */
+  imageTimestampMs: number | null;
   confidenceThreshold: number;
   minAreaHa: number;
   candidatesFound: number;
@@ -85,6 +94,7 @@ interface SelectedImageWindow {
   imageDate: string | null;
   imageAgeDays: number | null;
   cloudPercentage: number | null;
+  imageTimestampMs: number | null;
 }
 
 export async function analyzeFieldsSimple(input: SimpleAnalysisInput): Promise<SimpleAnalysisResult> {
@@ -96,7 +106,7 @@ export async function analyzeFieldsSimple(input: SimpleAnalysisInput): Promise<S
   const empty = (): SimpleAnalysisResult => ({
     type: "FeatureCollection", features: [],
     center: { lat, lng }, radiusM,
-    imageDate: null, imageAgeDays: null, cloudPercentage: null,
+    imageDate: null, imageAgeDays: null, cloudPercentage: null, imageTimestampMs: null,
     confidenceThreshold, minAreaHa,
     candidatesFound: 0, candidatesClassified: 0,
     warnings,
@@ -138,7 +148,7 @@ export async function analyzeFieldsSimple(input: SimpleAnalysisInput): Promise<S
   for (const candidate of candidates) {
     try {
       const center = polygonCentroid(candidate.coordinates);
-      const thumbnail = await captureParcelImage(center.lat, center.lng, 17, candidate.coordinates);
+      const thumbnail = await captureSentinel2ParcelImage(accessToken, projectId, center.lat, center.lng, 17, window.startDate, window.endDate);
       const classification = await callHFModel(thumbnail);
       const confidenceFraction = classification.confidence / 100;
       if (classification.is_barley && confidenceFraction >= confidenceThreshold) {
@@ -166,10 +176,82 @@ export async function analyzeFieldsSimple(input: SimpleAnalysisInput): Promise<S
     type: "FeatureCollection", features,
     center: { lat, lng }, radiusM,
     imageDate: window.imageDate, imageAgeDays: window.imageAgeDays, cloudPercentage: window.cloudPercentage,
+    imageTimestampMs: window.imageTimestampMs,
     confidenceThreshold, minAreaHa,
     candidatesFound: allCandidates.length, candidatesClassified: candidates.length,
     warnings,
   };
+}
+
+// ── Persistance dans la table `parcelles` (registre/dashboard) ──
+// La pipeline simple ne sauvegardait jusqu'ici que le blob complet du run (FieldScanRun,
+// pour /api/analyze/latest), jamais de ligne individuelle par parcelle détectée — contrairement
+// à la Version B (`saveAutomaticAnalysis`, automatic-parcels.ts). Sans ça, l'orge détectée par
+// Sentinel-2 s'affiche sur la carte au retour de la requête mais disparaît au rechargement et
+// n'apparaît jamais dans le registre/tableau de bord. Même pattern upsert-par-label que la
+// Version B : label dérivé du centroïde du polygone, stable d'une exécution à l'autre pour un
+// même champ réel.
+export async function saveSimpleFieldParcelles(features: SimpleFieldFeature[], warnings: string[]): Promise<void> {
+  for (const feature of features) {
+    try {
+      await saveSimpleFieldParcelle(feature);
+    } catch (error) {
+      console.warn("saveSimpleFieldParcelles: échec de la persistance d'un candidat :", error);
+      warnings.push(`Une parcelle détectée n'a pas pu être enregistrée dans le registre : ${getErrorMessage(error)}`);
+    }
+  }
+}
+
+async function saveSimpleFieldParcelle(feature: SimpleFieldFeature): Promise<void> {
+  const ring = feature.geometry.coordinates[0];
+  const coordinates: LatLng[] = ring.map(([lng, lat]) => ({ lat, lng }));
+  const center = polygonCentroid(coordinates);
+  const label = `simple-v1-${center.lat.toFixed(5)}-${center.lng.toFixed(5)}`;
+  const { confidence, areaHa, meanNDVI, meanNDRE, imageDate, imageAgeDays, cloudPercentage } = feature.properties;
+  const confidencePercent = Math.round(confidence * 1000) / 10;
+
+  const data: Prisma.ParcelleUncheckedCreateInput = {
+    label,
+    coordinates,
+    center_lat: center.lat,
+    center_lng: center.lng,
+    surface_ha: areaHa,
+    culture_declared: null,
+    culture_detected: "Orge",
+    ndvi_percentage: meanNDVI != null ? Math.round(meanNDVI * 1000) / 10 : null,
+    ndre: meanNDRE,
+    confidence: confidencePercent,
+    verdict: `Orge détectée (Sentinel-2, SNIC) — confiance ${confidencePercent}%`,
+    details: `Image Sentinel-2 du ${imageDate ?? "—"} (${imageAgeDays ?? "?"} j) · nuages ${cloudPercentage ?? "?"}%`,
+    saison: null,
+    soil_type: null,
+    risk_factors: [],
+    recommendations: null,
+    data_source: "Sentinel-2 simple (v1, segmentation SNIC)",
+    owner_name: null,
+    notes: null,
+    time_series_s1: [],
+    time_series_s2: [],
+    estimated_planting_date: null,
+    estimated_harvest_date: null,
+    days_since_planting: null,
+    growth_stage: null,
+    planting_confidence: null,
+    evi: null,
+    savi: null,
+    ndwi: null,
+    agro_score: null,
+    hybrid_score: null,
+    cnn_prob_barley: null,
+    cnn_prob_non_barley: null,
+  };
+
+  const existing = await prisma.parcelle.findFirst({ where: { label }, select: { id: true } });
+  if (existing) {
+    await prisma.parcelle.update({ where: { id: existing.id }, data });
+  } else {
+    await prisma.parcelle.create({ data });
+  }
 }
 
 // ── Sélection de la meilleure image S2 L2A (spec §1) ──
@@ -199,6 +281,7 @@ async function selectBestImageWindow(
     imageDate: imageDate.toISOString().slice(0, 10),
     imageAgeDays,
     cloudPercentage: chosen.cloudPercentage,
+    imageTimestampMs: chosen.imageDateMillis,
   };
 }
 
@@ -255,8 +338,8 @@ async function fetchImageMeta(
   }
 }
 
-// ── Masque nuage/ombre (SCL) + bandes + NDVI/NDRE + masque de plausibilité + vectorisation ──
-// (spec §2, §3, §4, §5, §9 — sans SNIC)
+// ── Masque nuage/ombre (SCL) + bandes + NDVI/NDRE + masque de plausibilité + segmentation SNIC ──
+// (spec §2, §3, §4, §5, §9)
 
 interface PolygonCandidate {
   coordinates: LatLng[];
@@ -322,26 +405,26 @@ async function fetchCandidatePolygons(
   values.plausible1 = geeCall("Image.and", { image1: ref("ndviOk"), image2: ref("ndreOk") });
   values.plausibleMask = geeCall("Image.and", { image1: ref("plausible1"), image2: ref("ndwiOk") });
 
-  // Supprime les petits groupes de pixels isolés (spec §9) : ne garde que les composantes connexes
-  // d'au moins minAreaHa. Remplace l'étape SNIC.
-  const minPixels = Math.max(1, Math.round((minAreaHa * 10_000) / 100)); // 1 pixel = 100 m² à 10 m
-  const maxSize = Math.min(256, minPixels + 32);
-  values.connectedCount = geeCall("Image.connectedPixelCount", {
-    input: ref("plausibleMask"), maxSize: geeConstant(maxSize), eightConnected: geeConstant(true),
+  // Segmentation SNIC (spec §9, « modèle de segmentation ») sur les zones plausibles : même
+  // algorithme et mêmes paramètres que buildSNICVectorsExpression (analyze-parcel.ts) /
+  // buildRegionSnicExpression (automatic-parcels.ts), appliqué ici à l'image mono-date
+  // masquée nuage/ombre (SCL) + NDRE de cette pipeline, plutôt qu'à un composite médian.
+  values.maskedForSegmentation = geeCall("Image.updateMask", { image: ref("withNdwi"), mask: ref("plausibleMask") });
+  values.vegetationImage = geeCall("Image.clip", { input: ref("maskedForSegmentation"), geometry: ref("region") });
+  values.snic = geeCall("Image.Segmentation.SNIC", {
+    image: ref("vegetationImage"),
+    size: geeConstant(SNIC_PARAMETERS.size),
+    compactness: geeConstant(SNIC_PARAMETERS.compactness),
+    connectivity: geeConstant(SNIC_PARAMETERS.connectivity),
+    neighborhoodSize: geeConstant(SNIC_PARAMETERS.neighborhoodSize),
   });
-  values.bigEnough = geeCall("Image.gte", { image1: ref("connectedCount"), image2: geeImageConstant(minPixels) });
-  values.cleanedMask = geeCall("Image.and", { image1: ref("plausibleMask"), image2: ref("bigEnough") });
-  values.selfMasked = geeCall("Image.selfMask", { image: ref("cleanedMask") });
-  values.candidateBand = geeCall("Image.rename", { input: ref("selfMasked"), names: geeConstant(["candidate"]) });
-
-  // Vectorisation directe du masque nettoyé (spec §9/§10) : reduceToVectors utilise la première
-  // bande de l'image pour définir les régions ; "candidate" doit donc être ajoutée en premier.
-  values.withLabel = geeCall("Image.addBands", { dstImg: ref("candidateBand"), srcImg: ref("withNdwi") });
+  values.snicClusters = geeCall("Image.select", { input: ref("snic"), bandSelectors: geeConstant(["clusters"]) });
+  values.vectorsImage = geeCall("Image.addBands", { dstImg: ref("snicClusters"), srcImg: ref("vegetationImage") });
   values.vectors = geeCall("Image.reduceToVectors", {
-    image: ref("withLabel"),
+    image: ref("vectorsImage"),
     reducer: geeCall("Reducer.mean", {}),
     geometry: ref("region"),
-    scale: geeConstant(10),
+    scale: geeConstant(SNIC_PARAMETERS.scale),
     geometryType: geeConstant("polygon"),
     eightConnected: geeConstant(true),
     labelProperty: geeConstant("segment_id"),

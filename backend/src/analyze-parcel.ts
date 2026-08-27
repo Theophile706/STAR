@@ -1,4 +1,5 @@
 import { setDefaultResultOrder } from "node:dns";
+import { lngLatToMercatorMeters } from "./field-watershed.js";
 
 setDefaultResultOrder("ipv4first");
 
@@ -85,8 +86,8 @@ export async function analyzeParcel(req: Request): Promise<Response> {
     const hfResult = satelliteImage ? await callHFModelSafely(satelliteImage, warnings) : null;
     const hybrid = hfResult
       ? computeHybridScore(hfResult.confidence, hfResult.is_barley, agro.score)
-      : createUnavailableHybridScore();
-    const season = detectSeason();
+      : createAgroOnlyHybridScore(agro.score);
+    const season = detectSeason(lat);
     const dataSource = ["Contour parcellaire réel", ...satData.dataSource, ...(hfResult ? [`HF OrgeDetector (${HF_MODEL_URL})`] : [])].join(" + ");
     const spectralParts: string[] = [];
     if (satData.ndvi != null) spectralParts.push(`NDVI=${satData.ndvi}%`);
@@ -127,11 +128,11 @@ export async function analyzeParcel(req: Request): Promise<Response> {
         : null,
       risk_factors: riskFactors,
       boundary_source: "Contour fourni par l’utilisateur, le cadastre ou une source agricole fiable",
-      recommendations: hfResult && hybrid.final_is_barley
-        ? `Orge ${hybrid.final_confidence > 70 ? "confirmée" : "probable"}. Score hybride ${hybrid.hybrid_score}% (CNN ${Math.round(hfResult.confidence)}% + Agro ${agro.score}%).`
-        : hfResult
-          ? `Non-orge détecté. Score hybride ${hybrid.hybrid_score}%. Vérification terrain recommandée.`
-          : "Analyse partielle : le modèle de classification est indisponible.",
+      recommendations: hfResult
+        ? hybrid.final_is_barley
+          ? `Orge ${hybrid.final_confidence > 70 ? "confirmée" : "probable"}. Score hybride ${hybrid.hybrid_score}% (CNN ${Math.round(hfResult.confidence)}% + Agro ${agro.score}%).`
+          : `Non-orge détecté. Score hybride ${hybrid.hybrid_score}%. Vérification terrain recommandée.`
+        : `${hybrid.final_is_barley ? "Orge probable" : "Non-orge probable"} (modèle CNN indisponible, estimation basée uniquement sur les règles agronomiques, score ${agro.score}%). Vérification terrain recommandée.`,
       anomaly_level: hybrid.final_is_barley ? "AUCUNE" : "FORTE", data_source: dataSource,
       warnings,
       radar_analysis: radarAnalysis, spectral_analysis: spectralAnalysis,
@@ -173,7 +174,7 @@ export type GeeValue = {
   };
 };
 
-const SNIC_PARAMETERS = {
+export const SNIC_PARAMETERS = {
   size: 15,
   compactness: 0.75,
   connectivity: 8,
@@ -525,7 +526,42 @@ function segmentZoomForArea(areaM2: number, latitude: number, fallbackZoom: numb
   return Math.max(fallbackZoom, Math.min(20, zoom));
 }
 
+export function getGeeProjectId(): string {
+  const serviceAccountJson = process.env.GEE_SERVICE_ACCOUNT_KEY;
+  if (!serviceAccountJson) return "earthengine-legacy";
+  try {
+    const serviceAccount = JSON.parse(serviceAccountJson) as { project_id?: unknown };
+    return typeof serviceAccount.project_id === "string" && serviceAccount.project_id.length > 0
+      ? serviceAccount.project_id
+      : "earthengine-legacy";
+  } catch {
+    return "earthengine-legacy";
+  }
+}
+
+// Le token GEE (JWT signé RSA + échange OAuth) est valable 1h côté Google, mais était
+// jusqu'ici re-signé/re-échangé à CHAQUE appel — y compris pour chaque tuile /api/sentinel-tiles
+// affichée, ce qui ajoutait un aller-retour OAuth complet (signature RSA + requête réseau) avant
+// même de commencer le vrai calcul GEE. Mis en cache en mémoire, avec une marge de sécurité avant
+// l'expiration réelle, et une dédup des appels concurrents (plusieurs tuiles demandées en même
+// temps ne doivent déclencher qu'un seul échange de token).
+const ACCESS_TOKEN_SAFETY_MARGIN_MS = 5 * 60_000;
+let cachedAccessToken: { token: string; expiresAt: number } | null = null;
+let accessTokenRequest: Promise<string> | null = null;
+
 export async function getGeeAccessToken(): Promise<string> {
+  if (cachedAccessToken && cachedAccessToken.expiresAt > Date.now()) {
+    return cachedAccessToken.token;
+  }
+  if (!accessTokenRequest) {
+    accessTokenRequest = fetchGeeAccessToken().finally(() => {
+      accessTokenRequest = null;
+    });
+  }
+  return accessTokenRequest;
+}
+
+async function fetchGeeAccessToken(): Promise<string> {
   const serviceAccountJson = process.env.GEE_SERVICE_ACCOUNT_KEY;
   if (!serviceAccountJson) throw new Error("GEE_SERVICE_ACCOUNT_KEY is not configured");
 
@@ -576,7 +612,9 @@ export async function getGeeAccessToken(): Promise<string> {
     throw new Error(`Failed to get GEE access token: ${tokenResp.status}`);
   }
 
-  return (await tokenResp.json()).access_token;
+  const token = (await tokenResp.json()).access_token as string;
+  cachedAccessToken = { token, expiresAt: Date.now() + 3_600_000 - ACCESS_TOKEN_SAFETY_MARGIN_MS };
+  return token;
 }
 
 // ── GEE Expression Builders ──
@@ -1307,6 +1345,133 @@ export async function captureParcelImage(lat: number, lng: number, zoom: number,
   return btoa(binary);
 }
 
+// ── Sentinel-2 comme source d'imagerie (remplace Google Static Maps pour la Version A) ──
+
+export interface PixelGrid {
+  widthPx: number;
+  heightPx: number;
+  originXMeters: number;
+  originYMeters: number;
+  scaleMeters: number;
+}
+
+/** Point de vérité unique pour la colorimétrie vrai-couleur Sentinel-2 (tuiles carto + miniatures CNN). */
+export function buildTrueColorVisualizeExpression(imageRef: GeeValue): GeeValue {
+  return geeCall("Image.visualize", {
+    image: imageRef,
+    bands: geeConstant(["B4", "B3", "B2"]),
+    min: geeConstant(0),
+    max: geeConstant(3000),
+  });
+}
+
+/** Variante de callGeeComputeRaw pour une image visualisée (3 bandes uint8) : renvoie directement les octets PNG. */
+export async function computePixelsPng(
+  accessToken: string,
+  projectId: string,
+  expression: { result: string; values: Record<string, GeeValue> },
+  grid: PixelGrid,
+): Promise<Uint8Array> {
+  const url = `https://earthengine.googleapis.com/v1/projects/${projectId}/image:computePixels`;
+  const body = {
+    expression,
+    fileFormat: "PNG",
+    grid: {
+      dimensions: { width: grid.widthPx, height: grid.heightPx },
+      affineTransform: {
+        scaleX: grid.scaleMeters,
+        shearX: 0,
+        translateX: grid.originXMeters,
+        shearY: 0,
+        scaleY: -grid.scaleMeters,
+        translateY: grid.originYMeters,
+      },
+      crsCode: "EPSG:3857",
+    },
+  };
+  const response = await fetchWithRetry(url, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }, GEE_COMPUTE_TIMEOUT_MS);
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`GEE computePixels (PNG) : erreur ${response.status} ${text.slice(0, 300)}`);
+  }
+  return new Uint8Array(await response.arrayBuffer());
+}
+
+/** Mètres/pixel à un zoom donné (même formule que zoomToFitRadius/segmentZoomForArea). */
+function metersPerPixelAtZoom(lat: number, zoom: number): number {
+  return (156_543.03392 * Math.cos((lat * Math.PI) / 180)) / (2 ** zoom);
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+
+/**
+ * Remplace captureParcelImage (Google Static Maps) pour la Version A (barley-detect-simple.ts) :
+ * miniature vrai-couleur Sentinel-2 centrée sur lat/lng, même contrat de sortie (PNG base64,
+ * 640x640) pour que callHFModel n'ait rien à changer.
+ *
+ * Sélectionne l'image la moins nuageuse dans [startDate, endDate] qui couvre RÉELLEMENT ce point
+ * — pas forcément l'image "globale" choisie par selectBestImageWindow pour toute la zone
+ * recherchée. Nécessaire dès que la zone dépasse une seule scène Sentinel-2 (~110 km) : un
+ * candidat peut venir d'une tuile de segmentation dont l'image la plus propre diffère de l'image
+ * globale, et forcer cette dernière produisait une collection vide -> Image.visualize(null) ->
+ * erreur 400 (constaté en conditions réelles avec un rayon de recherche de 3 km).
+ */
+export async function captureSentinel2ParcelImage(
+  accessToken: string,
+  projectId: string,
+  lat: number,
+  lng: number,
+  zoom: number,
+  startDate: string,
+  endDate: string,
+): Promise<string> {
+  const values: Record<string, GeeValue> = {};
+  const ref = (name: string): GeeValue => ({ valueReference: name });
+
+  values.point = geeCall("GeometryConstructors.Point", { coordinates: geeConstant([lng, lat]) });
+  values.region = geeCall("Geometry.buffer", { geometry: ref("point"), distance: geeConstant(5_000) });
+  values.intersects = geeCall("Filter.intersects", {
+    leftField: geeConstant(".all"),
+    rightValue: geeCall("Feature", { geometry: ref("region") }),
+  });
+  values.dateRange = geeCall("Filter.dateRangeContains", {
+    leftValue: geeCall("DateRange", { start: geeConstant(startDate), end: geeConstant(endDate) }),
+    rightField: geeConstant("system:time_start"),
+  });
+  values.raw = geeCall("ImageCollection.load", { id: geeConstant("COPERNICUS/S2_SR_HARMONIZED") });
+  values.byRegion = geeCall("Collection.filter", { collection: ref("raw"), filter: ref("intersects") });
+  values.byDate = geeCall("Collection.filter", { collection: ref("byRegion"), filter: ref("dateRange") });
+  values.sorted = geeCall("Collection.limit", {
+    collection: ref("byDate"), limit: geeConstant(1),
+    key: geeConstant("CLOUDY_PIXEL_PERCENTAGE"), ascending: geeConstant(true),
+  });
+  values.image = geeCall("Collection.first", { collection: ref("sorted") });
+  values.visualized = buildTrueColorVisualizeExpression(ref("image"));
+
+  const sizePx = 640;
+  const scaleMeters = metersPerPixelAtZoom(lat, zoom);
+  const halfSizeMeters = (sizePx / 2) * scaleMeters;
+  const center = lngLatToMercatorMeters(lng, lat);
+  const grid: PixelGrid = {
+    widthPx: sizePx,
+    heightPx: sizePx,
+    originXMeters: center.x - halfSizeMeters,
+    originYMeters: center.y + halfSizeMeters,
+    scaleMeters,
+  };
+
+  const pngBytes = await computePixelsPng(accessToken, projectId, { result: "visualized", values }, grid);
+  return bytesToBase64(pngBytes);
+}
+
 export interface HFModelResult {
   is_barley: boolean;
   confidence: number;
@@ -1325,12 +1490,20 @@ async function callHFModelSafely(imageBase64: string, warnings: string[]): Promi
   }
 }
 
-function createUnavailableHybridScore(): ReturnType<typeof computeHybridScore> {
+// Repli quand le CNN Hugging Face est indisponible : on ne peut pas se permettre de
+// déclarer "non-orge" par défaut (ça masquerait de vraies parcelles d'orge en cas de
+// panne du Space externe) — on retombe sur le score agronomique seul, avec un verdict
+// qui indique explicitement que la classification CNN n'a pas pu être faite.
+function createAgroOnlyHybridScore(agroScore: number): ReturnType<typeof computeHybridScore> {
+  const finalIsBarley = agroScore > 50;
+  const verdict = finalIsBarley
+    ? `⚠️ ORGE PROBABLE (CNN indisponible, estimation agro seule) — Score agro ${agroScore}%`
+    : `⚠️ NON-ORGE PROBABLE (CNN indisponible, estimation agro seule) — Score agro ${agroScore}%`;
   return {
-    hybrid_score: 0,
-    final_is_barley: false,
-    final_verdict: "⚠️ ANALYSE PARTIELLE — Modèle de classification indisponible",
-    final_confidence: 0,
+    hybrid_score: agroScore,
+    final_is_barley: finalIsBarley,
+    final_verdict: verdict,
+    final_confidence: agroScore,
   };
 }
 
@@ -1385,13 +1558,16 @@ export async function callHFModel(satelliteImageBase64: string): Promise<HFModel
 
 // ── Season detection ──
 
-function detectSeason(): string {
-  const month = new Date().getMonth() + 1;
-  if (month >= 10 || month <= 11) return "Semis / Levée";
-  if (month >= 12 || month <= 2) return "Tallage";
-  if (month >= 3 && month <= 4) return "Montaison";
+function detectSeason(lat: number): string {
+  const calendarMonth = new Date().getMonth() + 1; // 1-12, cycle calé sur l'hémisphère nord (semis oct-nov)
+  // Hémisphère sud : cycle décalé de 6 mois (semis avril-mai).
+  const month = lat < 0 ? (((calendarMonth - 1 + 6) % 12) + 1) : calendarMonth;
+
+  if (month === 10 || month === 11) return "Semis / Levée";
+  if (month === 12 || month === 1 || month === 2) return "Tallage";
+  if (month === 3 || month === 4) return "Montaison";
   if (month === 5) return "Épiaison";
   if (month === 6) return "Maturation";
-  if (month >= 7 && month <= 8) return "Récolte / Post-récolte";
-  return "Jachère";
+  if (month === 7 || month === 8) return "Récolte / Post-récolte";
+  return "Jachère"; // septembre
 }

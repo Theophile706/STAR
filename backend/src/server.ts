@@ -4,9 +4,18 @@ import Fastify from "fastify";
 import cors from "@fastify/cors";
 import { Prisma, PrismaClient } from "@prisma/client";
 import { z } from "zod";
-import { analyzeParcel } from "./analyze-parcel.js";
+import { analyzeParcel, getGeeAccessToken, getGeeProjectId } from "./analyze-parcel.js";
 import { detectAutomaticParcels } from "./automatic-parcels.js";
-import { analyzeFieldsSimple } from "./barley-detect-simple.js";
+import { analyzeFieldsSimple, saveSimpleFieldParcelles } from "./barley-detect-simple.js";
+import { fetchSentinel2TilePng } from "./sentinel-tiles.js";
+import { callFieldSegmentationModel } from "./field-segmentation.js";
+
+// PNG transparent 1x1, servi quand une tuile Sentinel-2 n'est pas disponible (tuile hors
+// empreinte de la scène, image manquante) pour éviter une icône "image cassée" côté carte.
+const TRANSPARENT_PNG = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+  "base64",
+);
 
 const app = Fastify({ logger: true });
 const prisma = new PrismaClient();
@@ -79,6 +88,12 @@ const automaticDetectionSchema = z.object({
   threshold: z.number().finite().min(2200).max(10000),
   periodDays: z.number().int().min(1).max(730),
 });
+const fieldSegmentationSchema = z.object({
+  fileBase64: z.string().min(1),
+  filename: z.string().min(1),
+  threshold: z.number().finite().min(0).max(1).optional(),
+});
+
 const parcelleSchema = z.object({
   label: z.string().max(200),
   coordinates: z.array(pointSchema).min(3),
@@ -220,6 +235,14 @@ app.post("/api/analyze", async (request, reply) => {
   const { latitude, longitude, radius, confidenceThreshold, minAreaHa } = parsed.data;
   const result = await analyzeFieldsSimple({ lat: latitude, lng: longitude, radiusM: radius, confidenceThreshold, minAreaHa });
 
+  // Enregistre chaque parcelle ORGE détectée dans le registre (table `parcelles`), sinon elle
+  // ne survit qu'en mémoire côté frontend et disparaît au rechargement / n'apparaît jamais dans
+  // le tableau de bord. Best-effort : un échec ne doit pas faire perdre le résultat déjà calculé.
+  if (result.features.length > 0) {
+    await saveSimpleFieldParcelles(result.features, result.warnings);
+    parcellesCache = null;
+  }
+
   // La persistance ne doit jamais faire perdre une analyse déjà calculée (appels GEE + CNN coûteux) :
   // un incident DB transitoire devient un avertissement, pas un 500 qui jette tout le résultat.
   try {
@@ -267,6 +290,60 @@ app.get("/api/analyze/latest", async (request, reply) => {
   if (!run) return reply.code(404).send({ error: "Aucune analyse enregistrée pour cette zone." });
 
   return reply.send({ analysisId: run.id, analysisDate: run.created_at, ...(run.result_geojson as Record<string, unknown>) });
+});
+
+const sentinelTileParamsSchema = z.object({
+  z: z.coerce.number().int().min(10).max(19),
+  x: z.coerce.number().int().min(0),
+  y: z.coerce.number().int().min(0),
+});
+const sentinelTileQuerySchema = z.object({
+  imageTimestampMs: z.coerce.number().finite().positive(),
+});
+
+app.get("/api/sentinel-tiles/:z/:x/:y", async (request, reply) => {
+  const params = sentinelTileParamsSchema.safeParse(request.params);
+  const query = sentinelTileQuerySchema.safeParse(request.query);
+  if (!params.success || !query.success) {
+    return reply.code(400).send({ error: "Coordonnées de tuile ou timestamp d'image invalides." });
+  }
+
+  try {
+    const accessToken = await getGeeAccessToken();
+    const projectId = getGeeProjectId();
+    const pngBytes = await fetchSentinel2TilePng(accessToken, projectId, params.data, query.data.imageTimestampMs);
+    reply.header("Cache-Control", "public, max-age=3600");
+    if (!pngBytes) return reply.type("image/png").send(TRANSPARENT_PNG);
+    return reply.type("image/png").send(Buffer.from(pngBytes));
+  } catch (error) {
+    app.log.warn({ err: error }, "sentinel-tiles: tuile indisponible");
+    reply.header("Cache-Control", "public, max-age=60");
+    return reply.type("image/png").send(TRANSPARENT_PNG);
+  }
+});
+
+// Fichier .nc/.npy en base64 : un patch 256×256×30 canaux float32 pèse ~10.5 Mo encodé,
+// bien au-delà du bodyLimit JSON par défaut de Fastify (1 Mo) — on l'augmente pour cette route.
+app.post("/api/field-segmentation", { bodyLimit: 20 * 1024 * 1024 }, async (request, reply) => {
+  const parsed = fieldSegmentationSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: "Fichier ou paramètres invalides.", details: parsed.error.flatten() });
+
+  const { fileBase64, filename, threshold } = parsed.data;
+  let fileBytes: Buffer;
+  try {
+    fileBytes = Buffer.from(fileBase64, "base64");
+  } catch {
+    return reply.code(400).send({ error: "fileBase64 invalide (attendu : encodage base64)." });
+  }
+
+  try {
+    const result = await callFieldSegmentationModel(fileBytes, filename, threshold ?? 0.5);
+    return reply.send(result);
+  } catch (error) {
+    app.log.warn({ err: error }, "field-segmentation: modèle indisponible");
+    const message = error instanceof Error ? error.message : "Modèle de segmentation indisponible.";
+    return reply.code(502).send({ error: message });
+  }
 });
 
 const port = Number(process.env.PORT ?? 3001);

@@ -20,21 +20,35 @@ AgriSat permet de tracer des parcelles agricoles sur une carte satellite, d’an
 Navigateur
    │
    ├── Frontend React + Vite (port 8080)
-   │     ├── Carte Google Maps et dessin de polygones
+   │     ├── Carte Google Maps (fond satellite) + dessin de polygones
+   │     ├── Fond Sentinel-2 superposé UNIQUEMENT sur la zone d'une analyse Sentinel-2 en cours
+   │     │   (pas un fond permanent : tuiles servies par le backend, /api/sentinel-tiles)
    │     ├── Analyse et affichage des résultats
    │     └── Tableau de bord des parcelles
    │
    └── API Fastify (port 3001)
          ├── Validation des requêtes avec Zod
          ├── Analyse satellite et classification
+         ├── Serveur de tuiles XYZ Sentinel-2 (/api/sentinel-tiles, mode "analyse" uniquement)
          └── Persistance avec Prisma
                   │
                   └── Base PostgreSQL
 
+Deux flux d'analyse, accessibles depuis le même panneau de recherche :
+- **Recherche automatique** (`automatic-parcels.ts` + `analyze-parcel.ts`) : cascade
+  Overpass/DB/watershed/SNIC pour délimiter les parcelles, image Google Static Maps envoyée au
+  modèle de classification.
+- **Analyse Sentinel-2** (`barley-detect-simple.ts`, `POST /api/analyze`) : sélection de la
+  meilleure image Sentinel-2 L2A, NDVI/NDRE, segmentation SNIC, image Sentinel-2 (pas Google)
+  envoyée au modèle de classification ; le résultat s'affiche sur un fond Sentinel-2 correspondant
+  exactement à l'image analysée.
+
 Services externes utilisés par le backend :
-- Google Earth Engine : données Sentinel-1 et Sentinel-2
-- Google Maps : fond cartographique et image de parcelle
-- Modèle Hugging Face : classification orge / non-orge
+- Google Earth Engine : données Sentinel-1 et Sentinel-2 (indices spectraux, segmentation SNIC,
+  imagerie envoyée au modèle de classification pour le flux Sentinel-2, tuiles de fond de carte)
+- Google Maps : fond satellite de la carte, et image de parcelle pour le flux de recherche
+  automatique
+- Modèle Hugging Face : classification orge / non-orge (image Google ou Sentinel-2 selon le flux)
 ```
 
 ## Prérequis
@@ -115,7 +129,7 @@ FRONTEND_ORIGIN=http://localhost:8080
 | `DATABASE_URL` | Oui | Chaîne de connexion PostgreSQL utilisée par Prisma. |
 | `GEE_SERVICE_ACCOUNT_KEY` | Oui | JSON complet du compte de service Google Earth Engine, sur une seule ligne. |
 | `HF_MODEL_URL` | Oui | URL du service de classification orge / non-orge. |
-| `GOOGLE_MAPS_API_KEY` | Oui | Clé utilisée pour récupérer l’image satellite transmise au modèle. |
+| `GOOGLE_MAPS_API_KEY` | Oui | Utilisée par le flux legacy (`/api/analyze-parcel`, recherche automatique) pour récupérer une image satellite transmise au modèle. Le flux principal (`/api/analyze`) utilise Sentinel-2/GEE à la place. |
 | `PORT` | Non | Port d’écoute du backend. Valeur par défaut : `3001`. |
 | `HOST` | Non | Hôte d’écoute du backend. Valeur par défaut : `0.0.0.0`. |
 | `FRONTEND_ORIGIN` | Non | Origines autorisées par CORS, séparées par des virgules si nécessaire. |
@@ -154,7 +168,10 @@ L’API est définie dans `backend/src/server.ts`.
 | `GET` | `/api/parcelles` | Retourne les parcelles enregistrées, de la plus récente à la plus ancienne. |
 | `POST` | `/api/parcelles` | Enregistre une parcelle et son résultat d’analyse. |
 | `DELETE` | `/api/parcelles/:id` | Supprime une parcelle par son identifiant UUID. |
-| `POST` | `/api/analyze-parcel` | Lance l’analyse satellite et la classification d’une parcelle. |
+| `POST` | `/api/analyze-parcel` | Lance l’analyse satellite et la classification d’une parcelle (flux legacy, Google Static Maps). |
+| `POST` | `/api/analyze` | Flux principal : GPS + rayon → Sentinel-2 L2A → NDVI/NDRE → segmentation SNIC → classification → GeoJSON des parcelles d’orge détectées. |
+| `GET` | `/api/analyze/latest` | Dernier résultat d’analyse Sentinel-2 enregistré pour une zone, sans relancer de calcul. |
+| `GET` | `/api/sentinel-tiles/:z/:x/:y` | Tuile PNG Sentinel-2 vrai-couleur de l’image utilisée par l’analyse la plus récente pour cette zone (fond de carte). |
 
 Le modèle Prisma `Parcelle` est décrit dans `backend/prisma/schema.prisma`. Il stocke notamment la géométrie, les indices spectraux (NDVI, EVI, SAVI, NDWI), les séries temporelles, les scores et le verdict.
 

@@ -25,11 +25,21 @@ export interface SimpleAnalysisResult {
   imageDate: string | null;
   imageAgeDays: number | null;
   cloudPercentage: number | null;
+  imageTimestampMs: number | null;
   confidenceThreshold: number;
   minAreaHa: number;
   candidatesFound: number;
   candidatesClassified: number;
   warnings: string[];
+}
+
+/**
+ * URL template (z/x/y) pour les tuiles Sentinel-2 de l'image exacte utilisée par une analyse
+ * (mode "analyse" uniquement — pas de fond de carte permanent, trop coûteux/fragile pour un
+ * pan/zoom libre : voir l'historique de sentinel-tiles.ts).
+ */
+export function buildSentinel2TileUrlTemplate(imageTimestampMs: number): string {
+  return `${API_URL}/api/sentinel-tiles/{z}/{x}/{y}?imageTimestampMs=${imageTimestampMs}`;
 }
 
 export async function runSimpleAnalysis(

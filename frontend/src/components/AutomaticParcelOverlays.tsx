@@ -6,6 +6,12 @@ interface AutomaticParcelOverlaysProps {
   parcels: AutomaticParcel[];
 }
 
+const SOURCE_LABELS: Record<string, string> = {
+  "field-boundary-model": "Modèle IA (U-Net)",
+  "gee-watershed-segmentation": "Watershed (GEE)",
+  "gee-snic-segmentation": "SNIC (GEE)",
+};
+
 export default function AutomaticParcelOverlays({ map, parcels }: AutomaticParcelOverlaysProps) {
   const polygonsRef = useRef<google.maps.Polygon[]>([]);
   const infoWindowRef = useRef<google.maps.InfoWindow | null>(null);
@@ -16,6 +22,43 @@ export default function AutomaticParcelOverlays({ map, parcels }: AutomaticParce
     polygonsRef.current.forEach((polygon) => polygon.setMap(null));
     polygonsRef.current = [];
     if (!infoWindowRef.current) infoWindowRef.current = new google.maps.InfoWindow();
+
+    // Contour réel de chaque parcelle candidate (Overpass, base, modèle IA, watershed,
+    // SNIC...), indépendamment du résultat de la classification orge — sans ça, le
+    // contour tracé par le modèle n'apparaît jamais si la confiance orge est < 70%.
+    parcels.forEach((parcel) => {
+      const path = cleanPolygonPath(parcel.coordinates);
+      if (path.length < 3) return;
+
+      const boundaryPolygon = new google.maps.Polygon({
+        paths: path,
+        strokeColor: "#38bdf8",
+        strokeWeight: 2,
+        strokeOpacity: 0.9,
+        fillColor: "#38bdf8",
+        fillOpacity: 0.05,
+        zIndex: 10,
+        map,
+      });
+      boundaryPolygon.addListener("mouseover", (event: google.maps.PolyMouseEvent) => {
+        boundaryPolygon.setOptions({ fillOpacity: 0.18, strokeWeight: 3 });
+        const content = document.createElement("div");
+        content.style.cssText = "font-family:'Space Grotesk',sans-serif;color:#333;min-width:160px;padding:4px";
+        const title = document.createElement("strong");
+        title.textContent = SOURCE_LABELS[parcel.tags.source ?? ""] ?? "Contour détecté";
+        content.append(title);
+        if (event.latLng) {
+          infoWindowRef.current?.setContent(content);
+          infoWindowRef.current?.setPosition(event.latLng);
+          infoWindowRef.current?.open(map);
+        }
+      });
+      boundaryPolygon.addListener("mouseout", () => {
+        boundaryPolygon.setOptions({ fillOpacity: 0.05, strokeWeight: 2 });
+        infoWindowRef.current?.close();
+      });
+      polygonsRef.current.push(boundaryPolygon);
+    });
 
     const barleySegments = parcels.flatMap(getDetectedBarleySegments);
     console.info(`[MAP] Parcelles d'orge affichées : ${barleySegments.length}`);
