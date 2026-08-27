@@ -8,6 +8,7 @@ import { analyzeParcel, getGeeAccessToken, getGeeProjectId } from "./analyze-par
 import { detectAutomaticParcels } from "./automatic-parcels.js";
 import { analyzeFieldsSimple, saveSimpleFieldParcelles } from "./barley-detect-simple.js";
 import { fetchSentinel2TilePng } from "./sentinel-tiles.js";
+import { callFieldSegmentationModel } from "./field-segmentation.js";
 
 // PNG transparent 1x1, servi quand une tuile Sentinel-2 n'est pas disponible (tuile hors
 // empreinte de la scène, image manquante) pour éviter une icône "image cassée" côté carte.
@@ -87,6 +88,12 @@ const automaticDetectionSchema = z.object({
   threshold: z.number().finite().min(2200).max(10000),
   periodDays: z.number().int().min(1).max(730),
 });
+const fieldSegmentationSchema = z.object({
+  fileBase64: z.string().min(1),
+  filename: z.string().min(1),
+  threshold: z.number().finite().min(0).max(1).optional(),
+});
+
 const parcelleSchema = z.object({
   label: z.string().max(200),
   coordinates: z.array(pointSchema).min(3),
@@ -312,6 +319,30 @@ app.get("/api/sentinel-tiles/:z/:x/:y", async (request, reply) => {
     app.log.warn({ err: error }, "sentinel-tiles: tuile indisponible");
     reply.header("Cache-Control", "public, max-age=60");
     return reply.type("image/png").send(TRANSPARENT_PNG);
+  }
+});
+
+// Fichier .nc/.npy en base64 : un patch 256×256×30 canaux float32 pèse ~10.5 Mo encodé,
+// bien au-delà du bodyLimit JSON par défaut de Fastify (1 Mo) — on l'augmente pour cette route.
+app.post("/api/field-segmentation", { bodyLimit: 20 * 1024 * 1024 }, async (request, reply) => {
+  const parsed = fieldSegmentationSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: "Fichier ou paramètres invalides.", details: parsed.error.flatten() });
+
+  const { fileBase64, filename, threshold } = parsed.data;
+  let fileBytes: Buffer;
+  try {
+    fileBytes = Buffer.from(fileBase64, "base64");
+  } catch {
+    return reply.code(400).send({ error: "fileBase64 invalide (attendu : encodage base64)." });
+  }
+
+  try {
+    const result = await callFieldSegmentationModel(fileBytes, filename, threshold ?? 0.5);
+    return reply.send(result);
+  } catch (error) {
+    app.log.warn({ err: error }, "field-segmentation: modèle indisponible");
+    const message = error instanceof Error ? error.message : "Modèle de segmentation indisponible.";
+    return reply.code(502).send({ error: message });
   }
 });
 

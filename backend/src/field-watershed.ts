@@ -34,7 +34,7 @@ export function mercatorMetersToLngLat(x: number, y: number): { lng: number; lat
 
 // ── Parsing minimal du format .npy (tableau 2D float32, C-order) ──
 
-export function parseNpyFloat32(buffer: ArrayBuffer): { data: Float32Array; shape: number[] } {
+function readNpyHeader(buffer: ArrayBuffer): { headerText: string; dataStart: number } {
   const bytes = new Uint8Array(buffer);
   const magic = String.fromCharCode(...bytes.slice(1, 6));
   if (magic !== "NUMPY") throw new Error("Format .npy invalide (magic manquant).");
@@ -47,6 +47,11 @@ export function parseNpyFloat32(buffer: ArrayBuffer): { data: Float32Array; shap
     : new DataView(buffer, headerLenOffset, 2).getUint16(0, true);
   const headerStart = headerLenOffset + headerLenBytes;
   const headerText = String.fromCharCode(...bytes.slice(headerStart, headerStart + headerLen));
+  return { headerText, dataStart: headerStart + headerLen };
+}
+
+export function parseNpyFloat32(buffer: ArrayBuffer): { data: Float32Array; shape: number[] } {
+  const { headerText, dataStart } = readNpyHeader(buffer);
 
   const shapeMatch = headerText.match(/'shape':\s*\(([^)]*)\)/);
   const descrMatch = headerText.match(/'descr':\s*'([^']+)'/);
@@ -56,12 +61,88 @@ export function parseNpyFloat32(buffer: ArrayBuffer): { data: Float32Array; shap
   if (!/f4$/.test(descr)) throw new Error(`Type .npy non supporté : ${descr} (float32 attendu).`);
   const littleEndian = !descr.startsWith(">");
 
-  const dataStart = headerStart + headerLen;
   const count = shape.reduce((a, b) => a * b, 1);
   const view = new DataView(buffer, dataStart, count * 4);
   const data = new Float32Array(count);
   for (let i = 0; i < count; i++) data[i] = view.getFloat32(i * 4, littleEndian);
   return { data, shape };
+}
+
+/**
+ * Parse un .npy "structuré" (dtype = liste de champs), tel que renvoyé par
+ * image:computePixels quand plusieurs bandIds sont demandés en un seul appel :
+ * chaque pixel est un enregistrement contenant une valeur par bande, dans l'ordre
+ * du dtype — pas un tableau plan par bande (BSQ), mais entrelacé par pixel (BIP).
+ * Accepte f4 (float32) et f8 (float64) par champ — GEE renvoie f8 pour un export
+ * multi-bandes même quand les bandes sources sont castées en float32 côté serveur.
+ * Retourne un Float32Array par bande, déjà dé-entrelacé (une bande = un tableau plat).
+ */
+export function parseNpyStructuredFloat32(buffer: ArrayBuffer): { bands: Record<string, Float32Array>; shape: number[] } {
+  const { headerText, dataStart } = readNpyHeader(buffer);
+
+  const shapeMatch = headerText.match(/'shape':\s*\(([^)]*)\)/);
+  if (!shapeMatch) throw new Error("En-tête .npy illisible (shape manquant).");
+  const shape = shapeMatch[1].split(",").map((s) => s.trim()).filter(Boolean).map(Number);
+
+  const fieldMatches = [...headerText.matchAll(/\('([^']+)',\s*'([^']+)'\)/g)];
+  if (fieldMatches.length === 0) throw new Error("En-tête .npy illisible (dtype structuré manquant).");
+
+  let offset = 0;
+  const fields = fieldMatches.map(([, name, descr]) => {
+    const byteSize = descr.endsWith("f4") ? 4 : descr.endsWith("f8") ? 8 : null;
+    if (byteSize === null) throw new Error(`Type .npy non supporté pour '${name}' : ${descr} (float32/float64 attendu).`);
+    const field = { name, byteSize, littleEndian: !descr.startsWith(">"), offset };
+    offset += byteSize;
+    return field;
+  });
+  const recordSize = offset;
+
+  const count = shape.reduce((a, b) => a * b, 1);
+  const view = new DataView(buffer, dataStart, count * recordSize);
+
+  const bands: Record<string, Float32Array> = {};
+  for (const field of fields) bands[field.name] = new Float32Array(count);
+
+  for (let i = 0; i < count; i++) {
+    const recordOffset = i * recordSize;
+    for (const field of fields) {
+      const fieldOffset = recordOffset + field.offset;
+      bands[field.name][i] = field.byteSize === 4
+        ? view.getFloat32(fieldOffset, field.littleEndian)
+        : view.getFloat64(fieldOffset, field.littleEndian);
+    }
+  }
+
+  return { bands, shape };
+}
+
+/** Encode un tableau float32 (C-order) en bytes .npy — symétrique de parseNpyFloat32. */
+export function encodeNpyFloat32(data: Float32Array, shape: number[]): Uint8Array {
+  const magic = "\x93NUMPY";
+  const version = new Uint8Array([1, 0]); // v1.0
+  const dict = `{'descr': '<f4', 'fortran_order': False, 'shape': (${shape.join(", ")}${shape.length === 1 ? "," : ""}), }`;
+
+  // L'en-tête total (magic + version + longueur + dict) doit être un multiple de 64 octets,
+  // complété par des espaces puis un '\n' final — convention du format .npy.
+  const unpaddedLen = magic.length + version.length + 2 + dict.length + 1;
+  const padLen = (64 - (unpaddedLen % 64)) % 64;
+  const header = dict + " ".repeat(padLen) + "\n";
+  const headerLen = header.length;
+
+  const buffer = new ArrayBuffer(magic.length + version.length + 2 + headerLen + data.length * 4);
+  const bytes = new Uint8Array(buffer);
+  let offset = 0;
+  for (let i = 0; i < magic.length; i++) bytes[offset++] = magic.charCodeAt(i);
+  bytes[offset++] = version[0];
+  bytes[offset++] = version[1];
+  new DataView(buffer, offset, 2).setUint16(0, headerLen, true);
+  offset += 2;
+  for (let i = 0; i < header.length; i++) bytes[offset++] = header.charCodeAt(i);
+
+  const dataView = new DataView(buffer, offset, data.length * 4);
+  for (let i = 0; i < data.length; i++) dataView.setFloat32(i * 4, data[i], true);
+
+  return bytes;
 }
 
 // ── Watershed marqué (priority-flood / immersion à la Vincent-Soille) ──

@@ -16,9 +16,11 @@ import {
   type GeeValue,
 } from "./analyze-parcel.js";
 import {
+  encodeNpyFloat32,
   lngLatToMercatorMeters,
   mercatorMetersToLngLat,
   parseNpyFloat32,
+  parseNpyStructuredFloat32,
   simplifyPolygon,
   traceLabelContours,
   watershedSegment,
@@ -68,10 +70,223 @@ const OVERPASS_API_URLS = [
   "https://overpass.kumi.systems/api/interpreter",
 ];
 const OVERPASS_USER_AGENT = process.env.OVERPASS_USER_AGENT ?? "fieldscan-ai/1.0 (+https://localhost)";
+const OVERPASS_REQUEST_TIMEOUT_MS = 10_000; // par miroir ; 3 miroirs dans OVERPASS_API_URLS = 30s max au lieu de 75s
+const DATABASE_DISCOVERY_TIMEOUT_MS = 8_000; // couvre un cold-start Neon normal sans bloquer toute la chaîne
 const MAX_CANDIDATES = 48;
 const MAX_SATELLITE_CELLS = 36;
-const ANALYSIS_CONCURRENCY = 2;
+const ANALYSIS_CONCURRENCY = 4;
+const ANALYSIS_TIME_BUDGET_MS = 60_000;
 const prisma = new PrismaClient();
+
+// Empêche un appel qui ne répond jamais (DB endormie, réseau qui pend) de bloquer toute
+// la chaîne de découverte — sans ça, une seule étape lente empêche les suivantes (dont
+// le modèle de segmentation) de jamais s'exécuter.
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} : dépassement de ${timeoutMs}ms`)), timeoutMs);
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error) => { clearTimeout(timer); reject(error); },
+    );
+  });
+}
+
+// ── Segmentation par modèle de segmentation de parcelles (U-Net, agri_field_segmentation) ──
+// Contrairement au watershed/SNIC ci-dessous (heuristiques classiques), ce modèle a été
+// entraîné spécifiquement pour délimiter des parcelles agricoles (dataset AI4Boundaries),
+// à partir de 30 canaux : B2/B3/B4/B8/NDVI sur 6 dates mensuelles (mars→août). Voir
+// agri_field_segmentation/data/dataset.py::load_ai4boundaries_image pour le format exact.
+const FIELD_SEGMENTATION_MODEL_URL = process.env.FIELD_SEGMENTATION_MODEL_URL;
+const FIELD_MODEL_TILE_PX = 256;
+const FIELD_MODEL_SCALE_M = 10; // doit correspondre à la résolution d'entraînement (10m/px)
+const FIELD_MODEL_REGION_RADIUS_KM = 2; // couvre la tuile carrée (2,56km de côté, demi-diagonale ~1,81km) avec marge
+const MAX_FIELD_MODEL_RADIUS_KM = 1.2; // tuile fixe : ne couvre pas un rayon de recherche plus large
+const FIELD_MODEL_MONTHS = ["03", "04", "05", "06", "07", "08"]; // fenêtre d'entraînement AI4Boundaries
+const FIELD_MODEL_CLOUD_LIMIT = 35;
+const FIELD_MODEL_GEE_CONCURRENCY = 3; // 30 appels image:computePixels par requête (5 bandes × 6 mois)
+const FIELD_MODEL_MIN_SEGMENT_AREA_M2 = 1_000;   // 0.1 ha, cohérent avec le watershed
+const FIELD_MODEL_MAX_SEGMENT_AREA_M2 = 800_000; // 80 ha
+const FIELD_MODEL_REQUEST_TIMEOUT_MS = 30_000;
+
+/** Dernière fenêtre mars-août complète : année en cours si on est en septembre ou après, sinon l'année précédente. */
+function fieldModelSeasonYear(): number {
+  const now = new Date();
+  return now.getUTCMonth() + 1 >= 9 ? now.getUTCFullYear() : now.getUTCFullYear() - 1;
+}
+
+/** Composite médian S2 d'un mois donné, bandes B2/B3/B4/B8 + NDVI, trous nuageux comblés à 0. */
+function buildMonthlyBandsExpression(lat: number, lng: number, year: number, month: string) {
+  const startDate = `${year}-${month}-01`;
+  const endDate = new Date(Date.UTC(year, Number(month), 1)).toISOString().slice(0, 10);
+  const values: Record<string, GeeValue> = {};
+  const reference = (name: string): GeeValue => ({ valueReference: name });
+
+  values.region = geeCall("GeometryConstructors.Polygon", {
+    coordinates: geeConstant(circleRegionCoordinates(lat, lng, FIELD_MODEL_REGION_RADIUS_KM)),
+  });
+  values.intersectsRegion = geeCall("Filter.intersects", {
+    leftField: geeConstant(".all"),
+    rightValue: geeCall("Feature", { geometry: reference("region") }),
+  });
+  values.dateRange = geeCall("Filter.dateRangeContains", {
+    leftValue: geeCall("DateRange", { start: geeConstant(startDate), end: geeConstant(endDate) }),
+    rightField: geeConstant("system:time_start"),
+  });
+  values.lowCloud = geeCall("Filter.lessThan", {
+    leftField: geeConstant("CLOUDY_PIXEL_PERCENTAGE"),
+    rightValue: geeConstant(FIELD_MODEL_CLOUD_LIMIT),
+  });
+  values.byRegion = geeCall("Collection.filter", {
+    collection: geeCall("ImageCollection.load", { id: geeConstant("COPERNICUS/S2_SR_HARMONIZED") }),
+    filter: reference("intersectsRegion"),
+  });
+  values.byDate = geeCall("Collection.filter", { collection: reference("byRegion"), filter: reference("dateRange") });
+  values.collection = geeCall("Collection.filter", { collection: reference("byDate"), filter: reference("lowCloud") });
+  values.composite = geeCall("reduce.median", { collection: reference("collection") });
+  values.spectral = geeCall("Image.select", {
+    input: reference("composite"),
+    bandSelectors: geeConstant(["B2", "B3", "B4", "B8"]),
+  });
+  values.withNdvi = addSpectralIndex(reference("spectral"), "NDVI", ["B8", "B4"]);
+  // Comble les trous nuageux/absents avec 0, comme nan_to_num(nan=0.0) côté modèle
+  // (load_ai4boundaries_image) — fait ici côté GEE plutôt que côté client.
+  // Note : pas de cast Image.toFloat ici — l'export NPY multi-bandes structuré renvoie
+  // du float64 (<f8) quel que soit le type source, et GEE a systématiquement rejeté
+  // Image.toFloat sur une image multi-bandes lors des tests (erreur "Parameter 'value'
+  // is required"). parseNpyStructuredFloat32 gère nativement f4 et f8, donc inutile.
+  values.finalImage = geeCall("Image.unmask", { input: reference("withNdvi"), value: geeImageConstant(0) });
+
+  return { result: "finalImage", values };
+}
+
+interface FieldModelGrid {
+  widthPx: number;
+  heightPx: number;
+  originXMeters: number;
+  originYMeters: number;
+  scaleMeters: number;
+}
+
+async function fetchFieldModelInputArray(
+  accessToken: string,
+  projectId: string,
+  lat: number,
+  lng: number,
+): Promise<{ array: Float32Array; grid: FieldModelGrid }> {
+  const year = fieldModelSeasonYear();
+  const center = lngLatToMercatorMeters(lng, lat);
+  const halfSizeMeters = (FIELD_MODEL_TILE_PX * FIELD_MODEL_SCALE_M) / 2;
+  const grid: FieldModelGrid = {
+    widthPx: FIELD_MODEL_TILE_PX,
+    heightPx: FIELD_MODEL_TILE_PX,
+    originXMeters: center.x - halfSizeMeters,
+    originYMeters: center.y + halfSizeMeters, // coin haut-gauche ; Y décroît vers le bas
+    scaleMeters: FIELD_MODEL_SCALE_M,
+  };
+
+  // Ordre = VARIABLES dans dataset.py : B2,B3,B4,B8,NDVI.
+  const bandNames = ["B2", "B3", "B4", "B8", "NDVI"];
+
+  // Un seul appel GEE par mois (NPY multi-bandes structuré) plutôt qu'un par bande :
+  // 6 appels au lieu de 30, même résultat, latence cumulée ~5x moindre.
+  const monthTasks = FIELD_MODEL_MONTHS.map((month, monthIndex) => ({ month, monthIndex }));
+  const monthlyResults = await mapWithConcurrency(monthTasks, FIELD_MODEL_GEE_CONCURRENCY, async ({ month, monthIndex }) => {
+    const expression = buildMonthlyBandsExpression(lat, lng, year, month);
+    const raster = await callGeeComputePixelsMultiBand(accessToken, projectId, expression, bandNames, grid);
+    return { monthIndex, raster };
+  });
+
+  const tileSize = FIELD_MODEL_TILE_PX * FIELD_MODEL_TILE_PX;
+  const array = new Float32Array(bandNames.length * FIELD_MODEL_MONTHS.length * tileSize);
+  for (const { monthIndex, raster } of monthlyResults) {
+    bandNames.forEach((bandName, bandIndex) => {
+      // Ordre canal = [B2×6,B3×6,B4×6,B8×6,NDVI×6], identique à VARIABLES dans dataset.py.
+      const channelIndex = bandIndex * FIELD_MODEL_MONTHS.length + monthIndex;
+      array.set(raster.bands[bandName], channelIndex * tileSize);
+    });
+  }
+
+  return { array, grid };
+}
+
+interface FieldModelPolygon {
+  points: Array<{ x: number; y: number }>;
+  score?: number;
+}
+
+interface FieldModelSegmentResponse {
+  polygons: FieldModelPolygon[];
+  image_width: number;
+  image_height: number;
+}
+
+/** Contrat attendu : POST multipart "file" -> tableau .npy (30,256,256) brut, réponse
+ * { polygons: [{points:[{x,y},...], score}], image_width, image_height } en coordonnées pixels
+ * (origine haut-gauche) — voir agri_field_segmentation/api.py::segment_endpoint. */
+async function callFieldBoundaryModel(rawArray: Float32Array): Promise<FieldModelSegmentResponse> {
+  const npyBytes = encodeNpyFloat32(rawArray, [5 * FIELD_MODEL_MONTHS.length, FIELD_MODEL_TILE_PX, FIELD_MODEL_TILE_PX]);
+  const formData = new FormData();
+  formData.append("file", new Blob([new Uint8Array(npyBytes)]), "field-input.npy");
+
+  const response = await fetchWithRetry(`${FIELD_SEGMENTATION_MODEL_URL}/segment`, {
+    method: "POST",
+    body: formData,
+  }, FIELD_MODEL_REQUEST_TIMEOUT_MS);
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`Modèle de segmentation de parcelles : erreur ${response.status} ${text.slice(0, 300)}`);
+  }
+  const data: unknown = await response.json();
+  if (!data || typeof data !== "object" || !Array.isArray((data as Record<string, unknown>).polygons)) {
+    throw new Error("Réponse du modèle de segmentation de parcelles invalide (champ 'polygons' manquant).");
+  }
+  return data as FieldModelSegmentResponse;
+}
+
+async function discoverAgriculturalParcelsFromFieldModel(
+  lat: number,
+  lng: number,
+  radiusKm: number,
+): Promise<CandidateParcel[]> {
+  if (!FIELD_SEGMENTATION_MODEL_URL) return [];
+  if (radiusKm > MAX_FIELD_MODEL_RADIUS_KM) return [];
+
+  const serviceAccountJson = process.env.GEE_SERVICE_ACCOUNT_KEY;
+  if (!serviceAccountJson || serviceAccountJson.startsWith("VOTRE_")) return [];
+
+  const accessToken = await getGeeAccessToken();
+  const projectId = getGeeProjectId();
+  const { array, grid } = await fetchFieldModelInputArray(accessToken, projectId, lat, lng);
+  const result = await callFieldBoundaryModel(array);
+
+  const candidates: CandidateParcel[] = [];
+  let index = 0;
+  for (const polygon of result.polygons) {
+    if (!Array.isArray(polygon.points) || polygon.points.length < 3) continue;
+
+    const coordinates = polygon.points.map((point) => {
+      const xMeters = grid.originXMeters + point.x * grid.scaleMeters;
+      const yMeters = grid.originYMeters - point.y * grid.scaleMeters;
+      const { lng: pointLng, lat: pointLat } = mercatorMetersToLngLat(xMeters, yMeters);
+      return { lat: pointLat, lng: pointLng };
+    });
+
+    const areaM2 = approximatePolygonAreaM2(coordinates);
+    if (areaM2 < FIELD_MODEL_MIN_SEGMENT_AREA_M2 || areaM2 > FIELD_MODEL_MAX_SEGMENT_AREA_M2) continue;
+    if (!isPlausibleFieldShape(coordinates, areaM2)) continue;
+
+    index++;
+    candidates.push({
+      id: `field-model-${lat.toFixed(6)}-${lng.toFixed(6)}-${index}`,
+      coordinates,
+      center: polygonCenter(coordinates),
+      tags: { source: "field-boundary-model" },
+    });
+  }
+
+  return candidates;
+}
 
 // ── Segmentation par watershed marqué + variance NDVI multi-temporelle (sans ML) ──
 // Approche la plus fiable des trois : suit les vrais gradients NDVI (comme un
@@ -127,6 +342,51 @@ async function callGeeComputePixels(
   const { data, shape } = parseNpyFloat32(arrayBuffer);
   const [height, width] = shape;
   return { data, width, height };
+}
+
+/**
+ * Variante multi-bandes de callGeeComputePixels : récupère plusieurs bandes en un seul
+ * appel GEE (NPY structuré) au lieu d'un appel par bande — réduit le nombre de requêtes
+ * (et donc la latence cumulée) d'un facteur égal au nombre de bandes demandées.
+ */
+async function callGeeComputePixelsMultiBand(
+  accessToken: string,
+  projectId: string,
+  expression: { result: string; values: Record<string, GeeValue> },
+  bandIds: string[],
+  grid: { widthPx: number; heightPx: number; originXMeters: number; originYMeters: number; scaleMeters: number },
+): Promise<{ bands: Record<string, Float32Array>; width: number; height: number }> {
+  const url = `https://earthengine.googleapis.com/v1/projects/${projectId}/image:computePixels`;
+  const body = {
+    expression,
+    fileFormat: "NPY",
+    bandIds,
+    grid: {
+      dimensions: { width: grid.widthPx, height: grid.heightPx },
+      affineTransform: {
+        scaleX: grid.scaleMeters,
+        shearX: 0,
+        translateX: grid.originXMeters,
+        shearY: 0,
+        scaleY: -grid.scaleMeters,
+        translateY: grid.originYMeters,
+      },
+      crsCode: "EPSG:3857",
+    },
+  };
+  const response = await fetchWithRetry(url, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }, GEE_COMPUTE_TIMEOUT_MS);
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`GEE computePixels (${bandIds.join(",")}) : erreur ${response.status} ${text.slice(0, 300)}`);
+  }
+  const arrayBuffer = await response.arrayBuffer();
+  const { bands, shape } = parseNpyStructuredFloat32(arrayBuffer);
+  const [height, width] = shape;
+  return { bands, width, height };
 }
 
 /**
@@ -370,16 +630,6 @@ const MAX_PARCEL_SEGMENT_AREA_M2 = 800_000; // 80 ha
 const MAX_SEGMENTATION_RADIUS_KM = 5; // au-delà, le coût de calcul GEE devient trop élevé (timeout probable)
 const CIRCLE_REGION_VERTICES = 48;
 
-// ── Alternative (optionnelle) : modèle externe de segmentation ──
-const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
-const FIELD_SEGMENTATION_MODEL_URL = process.env.FIELD_SEGMENTATION_MODEL_URL;
-const SEGMENTATION_IMAGE_SIZE = 640;
-const SEGMENTATION_MARGIN_FACTOR = 1.3;
-// Au-delà de ce rayon, la résolution d'une image 640x640 devient trop grossière
-// pour distinguer des limites de champs individuelles : on repasse sur la grille.
-const MAX_MODEL_SEGMENTATION_RADIUS_KM = 3;
-const SEGMENTATION_MIN_POLYGON_AREA_M2 = 200;
-
 type OverpassElement = {
   type?: string;
   id?: number;
@@ -392,11 +642,27 @@ export async function detectAutomaticParcels({ lat, lng, radiusKm, baseTemperatu
     const candidates = await discoverAgriculturalParcels(lat, lng, radiusKm);
     const config = { baseTemperature, threshold, periodDays };
     const analyzedCandidates = candidates.slice(0, MAX_CANDIDATES);
-    const watershedFallback = analyzedCandidates.some((candidate) => candidate.tags.source === "gee-watershed-segmentation");
-    const geeSegmentationFallback = !watershedFallback && analyzedCandidates.some((candidate) => candidate.tags.source === "gee-snic-segmentation");
-    const modelSegmentationFallback = !watershedFallback && !geeSegmentationFallback && analyzedCandidates.some((candidate) => candidate.tags.source === "satellite-segmentation");
-    const satelliteWindowFallback = !watershedFallback && !geeSegmentationFallback && !modelSegmentationFallback && analyzedCandidates.some((candidate) => candidate.tags.source?.startsWith("satellite-search"));
-    const analyzedParcels = await mapWithConcurrency(analyzedCandidates, ANALYSIS_CONCURRENCY, (candidate) => analyzeCandidate(candidate, config));
+    const fieldModelFallback = analyzedCandidates.some((candidate) => candidate.tags.source === "field-boundary-model");
+    const watershedFallback = !fieldModelFallback && analyzedCandidates.some((candidate) => candidate.tags.source === "gee-watershed-segmentation");
+    const geeSegmentationFallback = !fieldModelFallback && !watershedFallback && analyzedCandidates.some((candidate) => candidate.tags.source === "gee-snic-segmentation");
+    const satelliteWindowFallback = !fieldModelFallback && !watershedFallback && !geeSegmentationFallback && analyzedCandidates.some((candidate) => candidate.tags.source?.startsWith("satellite-search"));
+    // Chaque analyse (analyzeCandidate -> analyzeParcel, SNIC + CNN + GEE) coûte ~30-40s :
+    // avec beaucoup de candidats (ex: Overpass en retourne parfois des dizaines), les
+    // analyser tous séquentiellement/à faible concurrence peut prendre 10+ minutes.
+    // On borne donc la phase d'analyse par un budget de temps global plutôt que de
+    // deviner un nombre de candidats : les candidats non traités à temps repartent avec
+    // le même statut "non analysé" que ceux au-delà de MAX_CANDIDATES (voir plus bas).
+    const { results: analyzedResults } = await mapWithConcurrencyDeadline(
+      analyzedCandidates,
+      ANALYSIS_CONCURRENCY,
+      ANALYSIS_TIME_BUDGET_MS,
+      (candidate) => analyzeCandidate(candidate, config),
+    );
+    const analyzedParcels = analyzedCandidates.map((candidate, index) => analyzedResults.get(index) ?? {
+      ...candidate,
+      analysis: null,
+      analysis_error: "Analyse IA non exécutée : délai de recherche automatique dépassé (trop de parcelles candidates).",
+    });
     const analyzedIds = new Set(analyzedCandidates.map((candidate) => candidate.id));
     const parcels = [
       ...analyzedParcels,
@@ -418,12 +684,12 @@ export async function detectAutomaticParcels({ lat, lng, radiusKm, baseTemperatu
       candidates_found: candidates.length,
       analyzed_count: parcels.filter((parcel) => parcel.analysis !== null).length,
       parcels,
-      notice: watershedFallback
-        ? "Aucun contour vectoriel référencé : les limites de parcelles ont été détectées automatiquement par watershed + analyse NDVI multi-temporelle (Google Earth Engine, sans modèle IA)."
-        : geeSegmentationFallback
-          ? "Aucun contour vectoriel référencé : les limites de parcelles ont été détectées automatiquement par segmentation d’image satellite (SNIC / Google Earth Engine, sans modèle IA)."
-          : modelSegmentationFallback
-            ? "Aucun contour vectoriel référencé : les limites de parcelles ont été détectées automatiquement par segmentation d’image satellite (modèle IA)."
+      notice: fieldModelFallback
+        ? "Aucun contour vectoriel référencé : les limites de parcelles ont été détectées automatiquement par le modèle de segmentation U-Net (IA, entraîné sur AI4Boundaries)."
+        : watershedFallback
+          ? "Aucun contour vectoriel référencé : les limites de parcelles ont été détectées automatiquement par watershed + analyse NDVI multi-temporelle (Google Earth Engine, sans modèle IA)."
+          : geeSegmentationFallback
+            ? "Aucun contour vectoriel référencé : les limites de parcelles ont été détectées automatiquement par segmentation d’image satellite (SNIC / Google Earth Engine, sans modèle IA)."
             : satelliteWindowFallback
               ? "Aucun contour vectoriel n’a été trouvé : plusieurs cellules satellite autour du point sont analysées sans créer de fausse parcelle en base."
               : candidates.length === 0
@@ -451,11 +717,22 @@ export async function detectAutomaticParcels({ lat, lng, radiusKm, baseTemperatu
 }
 
 async function discoverAgriculturalParcels(lat: number, lng: number, radiusKm: number): Promise<CandidateParcel[]> {
-  const candidates = await discoverAgriculturalParcelsFromOverpass(lat, lng, radiusKm);
+  // Overpass et la base sont indépendants l'un de l'autre : les lancer en parallèle
+  // (plutôt qu'en séquence) coupe le pire cas cumulé en deux, sans changer l'ordre de
+  // priorité — Overpass reste préféré à la base si les deux ont trouvé quelque chose.
+  const [candidates, databaseCandidates] = await Promise.all([
+    discoverAgriculturalParcelsFromOverpass(lat, lng, radiusKm),
+    discoverAgriculturalParcelsFromDatabase(lat, lng, radiusKm),
+  ]);
   if (candidates.length > 0) return ensureCoordinateCoverage(candidates, lat, lng, radiusKm);
-
-  const databaseCandidates = await discoverAgriculturalParcelsFromDatabase(lat, lng, radiusKm);
   if (databaseCandidates.length > 0) return ensureCoordinateCoverage(databaseCandidates, lat, lng, radiusKm);
+
+  try {
+    const fieldModelCandidates = await discoverAgriculturalParcelsFromFieldModel(lat, lng, radiusKm);
+    if (fieldModelCandidates.length > 0) return ensureCoordinateCoverage(fieldModelCandidates, lat, lng, radiusKm);
+  } catch (error) {
+    console.warn("discoverAgriculturalParcelsFromFieldModel failed, trying next fallback:", error);
+  }
 
   try {
     const watershedCandidates = await discoverAgriculturalParcelsFromWatershed(lat, lng, radiusKm);
@@ -471,22 +748,31 @@ async function discoverAgriculturalParcels(lat: number, lng: number, radiusKm: n
     console.warn("discoverAgriculturalParcelsFromGeeSegmentation failed, trying next fallback:", error);
   }
 
-  try {
-    const segmentedCandidates = await discoverAgriculturalParcelsFromSegmentation(lat, lng, radiusKm);
-    if (segmentedCandidates.length > 0) return ensureCoordinateCoverage(segmentedCandidates, lat, lng, radiusKm);
-  } catch (error) {
-    console.warn("discoverAgriculturalParcelsFromSegmentation failed, falling back to grid:", error);
-  }
-
   return createSatelliteSearchCellCandidates(lat, lng, radiusKm);
 }
 
+// Distance en dessous de laquelle deux candidats sont considérés comme la même parcelle
+// (ex: doublons en base) plutôt que deux champs voisins distincts.
+const DUPLICATE_CANDIDATE_DISTANCE_KM = 0.005; // 5 m
+
+/** Ne garde qu'un seul candidat par groupe de centres quasi-identiques — évite de
+ * gaspiller le budget d'analyse sur des doublons (ex: parcelles enregistrées plusieurs
+ * fois en base). */
+function deduplicateByCenter<T extends { center: { lat: number; lng: number } }>(candidates: T[]): T[] {
+  const kept: T[] = [];
+  for (const candidate of candidates) {
+    const isDuplicate = kept.some((existing) => distanceBetweenPoints(existing.center, candidate.center) < DUPLICATE_CANDIDATE_DISTANCE_KM);
+    if (!isDuplicate) kept.push(candidate);
+  }
+  return kept;
+}
+
 function ensureCoordinateCoverage(candidates: CandidateParcel[], lat: number, lng: number, radiusKm: number): CandidateParcel[] {
-  const constrainedCandidates = candidates.flatMap((candidate) => {
+  const constrainedCandidates = deduplicateByCenter(candidates.flatMap((candidate) => {
     const coordinates = clipPolygonToRadius(candidate.coordinates, { lat, lng }, radiusKm);
     if (coordinates.length < 3) return [];
     return [{ ...candidate, coordinates, center: polygonCenter(coordinates) }];
-  });
+  }));
   const satelliteCells = createSatelliteSearchCellCandidates(lat, lng, radiusKm)
     .filter((cell) => !constrainedCandidates.some((candidate) => pointInPolygon(cell.center, candidate.coordinates)));
   return [...constrainedCandidates, ...satelliteCells].slice(0, MAX_CANDIDATES);
@@ -519,177 +805,6 @@ function createSatelliteSearchCellCandidates(lat: number, lng: number, radiusKm:
   return cells
     .sort((left, right) => distanceBetweenPoints(center, left.center) - distanceBetweenPoints(center, right.center))
     .slice(0, MAX_SATELLITE_CELLS);
-}
-
-// ── Web Mercator : conversion pixel image <-> lat/lng (même projection que les tuiles Google Maps) ──
-const WORLD_TILE_SIZE = 256;
-
-function latLngToWorldPoint(lat: number, lng: number): { x: number; y: number } {
-  const sinY = Math.min(Math.max(Math.sin((lat * Math.PI) / 180), -0.9999), 0.9999);
-  return {
-    x: WORLD_TILE_SIZE * (0.5 + lng / 360),
-    y: WORLD_TILE_SIZE * (0.5 - Math.log((1 + sinY) / (1 - sinY)) / (4 * Math.PI)),
-  };
-}
-
-function worldPointToLatLng(x: number, y: number): { lat: number; lng: number } {
-  const lng = (x / WORLD_TILE_SIZE - 0.5) * 360;
-  const n = Math.PI - (2 * Math.PI * y) / WORLD_TILE_SIZE;
-  const lat = (180 / Math.PI) * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
-  return { lat, lng };
-}
-
-/** Convertit un pixel (origine en haut à gauche) d'une image Static Maps en lat/lng. */
-function pixelToLatLng(
-  px: number,
-  py: number,
-  center: { lat: number; lng: number },
-  zoom: number,
-  imageWidthPx: number,
-  imageHeightPx: number,
-): { lat: number; lng: number } {
-  const scale = 2 ** zoom;
-  const centerWorld = latLngToWorldPoint(center.lat, center.lng);
-  const centerPixel = { x: centerWorld.x * scale, y: centerWorld.y * scale };
-  const originPixel = { x: centerPixel.x - imageWidthPx / 2, y: centerPixel.y - imageHeightPx / 2 };
-  const worldX = (originPixel.x + px) / scale;
-  const worldY = (originPixel.y + py) / scale;
-  return worldPointToLatLng(worldX, worldY);
-}
-
-/** Zoom Static Maps le plus élevé qui garde le disque de rayon radiusKm dans l'image. */
-function zoomToFitRadius(lat: number, radiusKm: number, imageSizePx: number): number {
-  const diameterMeters = 2 * radiusKm * 1000 * SEGMENTATION_MARGIN_FACTOR;
-  const metersPerPixelAtZoom0 = 156_543.03392 * Math.cos((lat * Math.PI) / 180);
-  const rawZoom = Math.log2((metersPerPixelAtZoom0 * imageSizePx) / diameterMeters);
-  return Math.min(20, Math.max(1, Math.floor(rawZoom)));
-}
-
-function polygonAreaM2(polygon: Array<{ lat: number; lng: number }>): number {
-  if (polygon.length < 3) return 0;
-  const longitudeScale = Math.max(Math.abs(Math.cos((polygon[0].lat * Math.PI) / 180)), 0.1);
-  const toMeters = (point: { lat: number; lng: number }) => ({
-    x: point.lng * 111_320 * longitudeScale,
-    y: point.lat * 110_574,
-  });
-  const points = polygon.map(toMeters);
-  let sum = 0;
-  for (let i = 0; i < points.length; i++) {
-    const a = points[i];
-    const b = points[(i + 1) % points.length];
-    sum += a.x * b.y - b.x * a.y;
-  }
-  return Math.abs(sum) / 2;
-}
-
-async function fetchSatelliteImageBase64(
-  lat: number,
-  lng: number,
-  zoom: number,
-  sizePx: number,
-): Promise<string> {
-  if (!GOOGLE_MAPS_API_KEY || GOOGLE_MAPS_API_KEY.startsWith("VOTRE_")) {
-    throw new Error("GOOGLE_MAPS_API_KEY n’est pas configurée.");
-  }
-  const params = new URLSearchParams({
-    center: `${lat},${lng}`,
-    zoom: String(zoom),
-    size: `${sizePx}x${sizePx}`,
-    maptype: "satellite",
-    key: GOOGLE_MAPS_API_KEY,
-  });
-  const response = await fetch(`https://maps.googleapis.com/maps/api/staticmap?${params.toString()}`, {
-    signal: AbortSignal.timeout(20_000),
-  });
-  if (!response.ok) throw new Error(`Google Maps Static API error: ${response.status}`);
-  const arrayBuffer = await response.arrayBuffer();
-  const bytes = new Uint8Array(arrayBuffer);
-  let binary = "";
-  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-  return btoa(binary);
-}
-
-interface SegmentationPolygonResponse {
-  /** Coordonnées en pixels, origine en haut à gauche de l'image envoyée. */
-  points: Array<{ x: number; y: number }>;
-  score?: number;
-  label?: string;
-}
-
-interface SegmentationModelResponse {
-  polygons: SegmentationPolygonResponse[];
-  image_width?: number;
-  image_height?: number;
-}
-
-/**
- * Appelle un modèle externe de segmentation de champs (ex: un Space HF basé sur
- * SAM / un modèle de délinéation parcellaire) sur une image satellite statique,
- * puis géoréférence les polygones retournés (en pixels) vers des lat/lng.
- *
- * Contrat attendu côté modèle : POST multipart "file" -> image satellite (PNG/JPEG),
- * réponse JSON { polygons: [{ points: [{x,y}, ...], score?, label? }, ...] }
- * avec des coordonnées pixels dans le repère de l'image envoyée (haut-gauche = origine).
- */
-async function callFieldSegmentationModel(imageBase64: string): Promise<SegmentationModelResponse> {
-  const binaryStr = atob(imageBase64);
-  const bytes = new Uint8Array(binaryStr.length);
-  for (let i = 0; i < binaryStr.length; i++) bytes[i] = binaryStr.charCodeAt(i);
-
-  const formData = new FormData();
-  formData.append("file", new Blob([bytes], { type: "image/png" }), "parcel-area.png");
-
-  const response = await fetch(`${FIELD_SEGMENTATION_MODEL_URL}/segment`, {
-    method: "POST",
-    body: formData,
-    signal: AbortSignal.timeout(30_000),
-  });
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    throw new Error(`Modèle de segmentation : erreur ${response.status} ${text.slice(0, 300)}`);
-  }
-  const data: unknown = await response.json();
-  if (!data || typeof data !== "object" || !Array.isArray((data as Record<string, unknown>).polygons)) {
-    throw new Error("Réponse du modèle de segmentation invalide (champ 'polygons' manquant).");
-  }
-  return data as SegmentationModelResponse;
-}
-
-// ── Alternative (optionnelle) : segmentation par modèle externe ──
-async function discoverAgriculturalParcelsFromSegmentation(
-  lat: number,
-  lng: number,
-  radiusKm: number,
-): Promise<CandidateParcel[]> {
-  if (!FIELD_SEGMENTATION_MODEL_URL) return [];
-  if (radiusKm > MAX_MODEL_SEGMENTATION_RADIUS_KM) return [];
-
-  const zoom = zoomToFitRadius(lat, radiusKm, SEGMENTATION_IMAGE_SIZE);
-  const imageBase64 = await fetchSatelliteImageBase64(lat, lng, zoom, SEGMENTATION_IMAGE_SIZE);
-  const result = await callFieldSegmentationModel(imageBase64);
-  const imageWidth = result.image_width ?? SEGMENTATION_IMAGE_SIZE;
-  const imageHeight = result.image_height ?? SEGMENTATION_IMAGE_SIZE;
-  const center = { lat, lng };
-
-  return result.polygons.flatMap((polygon, index): CandidateParcel[] => {
-    if (!Array.isArray(polygon.points) || polygon.points.length < 3) return [];
-    const coordinates = polygon.points.flatMap((point) => {
-      if (typeof point.x !== "number" || typeof point.y !== "number") return [];
-      return [pixelToLatLng(point.x, point.y, center, zoom, imageWidth, imageHeight)];
-    });
-    if (coordinates.length < 3) return [];
-    if (polygonAreaM2(coordinates) < SEGMENTATION_MIN_POLYGON_AREA_M2) return [];
-    return [{
-      id: `segmentation-${lat.toFixed(6)}-${lng.toFixed(6)}-${index}`,
-      coordinates,
-      center: polygonCenter(coordinates),
-      tags: {
-        source: "satellite-segmentation",
-        ...(polygon.label ? { crop_hint: polygon.label } : {}),
-        ...(typeof polygon.score === "number" ? { segmentation_score: String(polygon.score) } : {}),
-      },
-    }];
-  });
 }
 
 // ── Segmentation GEE/SNIC (sans modèle ML) ──
@@ -867,7 +982,7 @@ async function discoverAgriculturalParcelsFromOverpass(lat: number, lng: number,
           "User-Agent": OVERPASS_USER_AGENT,
         },
         body: new URLSearchParams({ data: query }),
-        signal: AbortSignal.timeout(25_000),
+        signal: AbortSignal.timeout(OVERPASS_REQUEST_TIMEOUT_MS),
       });
       if (!response.ok) {
         const text = await response.text().catch(() => "");
@@ -916,12 +1031,16 @@ async function discoverAgriculturalParcelsFromDatabase(lat: number, lng: number,
 
   let rows;
   try {
-    rows = await prisma.parcelle.findMany({
-      where: {
-        center_lat: { gte: minLat, lte: maxLat },
-        center_lng: { gte: minLng, lte: maxLng },
-      },
-    });
+    rows = await withTimeout(
+      prisma.parcelle.findMany({
+        where: {
+          center_lat: { gte: minLat, lte: maxLat },
+          center_lng: { gte: minLng, lte: maxLng },
+        },
+      }),
+      DATABASE_DISCOVERY_TIMEOUT_MS,
+      "discoverAgriculturalParcelsFromDatabase",
+    );
   } catch (error) {
     console.error("Database access error for parcel discovery:", error);
     return [];
@@ -1325,4 +1444,36 @@ async function mapWithConcurrency<T, R>(items: T[], concurrency: number, mapper:
 
   await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
   return results;
+}
+
+/**
+ * Variante de mapWithConcurrency bornée par un budget de temps global plutôt que par le
+ * nombre d'éléments : une fois le délai dépassé, aucun nouvel élément n'est démarré (ceux
+ * déjà en cours vont à leur terme). Les éléments non traités sont simplement absents de
+ * la Map résultat — à l'appelant de leur donner un statut "non traité".
+ */
+async function mapWithConcurrencyDeadline<T, R>(
+  items: T[],
+  concurrency: number,
+  deadlineMs: number,
+  mapper: (item: T) => Promise<R>,
+): Promise<{ results: Map<number, R>; timedOut: boolean }> {
+  const deadlineAt = Date.now() + deadlineMs;
+  const results = new Map<number, R>();
+  let cursor = 0;
+  let timedOut = false;
+
+  async function worker() {
+    while (cursor < items.length) {
+      if (Date.now() >= deadlineAt) {
+        timedOut = true;
+        return;
+      }
+      const index = cursor++;
+      results.set(index, await mapper(items[index]));
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
+  return { results, timedOut };
 }
