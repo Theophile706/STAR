@@ -1067,7 +1067,7 @@ async function discoverAgriculturalParcelsFromDatabase(lat: number, lng: number,
   });
 }
 
-interface GrowingDegreeDaySummary {
+export interface GrowingDegreeDaySummary {
   cumulative: number;
   detected: boolean;
   startDate: string;
@@ -1380,7 +1380,7 @@ function formatDate(date: Date): string {
   return date.toISOString().slice(0, 10);
 }
 
-async function fetchGrowingDegreeDays(lat: number, lng: number, config: BarleyDetectionConfig): Promise<GrowingDegreeDaySummary> {
+export async function fetchGrowingDegreeDays(lat: number, lng: number, config: BarleyDetectionConfig): Promise<GrowingDegreeDaySummary> {
   const endDate = new Date();
   endDate.setUTCDate(endDate.getUTCDate() - 2);
   const startDate = new Date(endDate);

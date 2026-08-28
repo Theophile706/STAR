@@ -12,6 +12,7 @@ export interface SimpleFieldFeature {
     imageDate: string | null;
     imageAgeDays: number | null;
     cloudPercentage: number | null;
+    barleyPresence: "confirmed" | "probable";
   };
 }
 
@@ -30,6 +31,8 @@ export interface SimpleAnalysisResult {
   minAreaHa: number;
   candidatesFound: number;
   candidatesClassified: number;
+  gddCumulative: number | null;
+  gddThreshold: number;
   warnings: string[];
 }
 
@@ -46,7 +49,13 @@ export async function runSimpleAnalysis(
   lat: number,
   lng: number,
   radiusM: number,
-  options?: { confidenceThreshold?: number; minAreaHa?: number },
+  options?: {
+    confidenceThreshold?: number;
+    minAreaHa?: number;
+    baseTemperature?: number;
+    threshold?: number;
+    periodDays?: number;
+  },
 ): Promise<SimpleAnalysisResult> {
   const response = await fetch(`${API_URL}/api/analyze`, {
     method: "POST",

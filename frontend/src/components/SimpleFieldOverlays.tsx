@@ -34,7 +34,7 @@ export default function SimpleFieldOverlays({ map, result }: SimpleFieldOverlays
       });
       polygon.addListener("mouseover", (event: google.maps.PolyMouseEvent) => {
         polygon.setOptions({ fillOpacity: 0.42, strokeWeight: 5 });
-        const { confidence, areaHa, meanNDVI, meanNDRE, imageDate, imageAgeDays, cloudPercentage } = feature.properties;
+        const { confidence, areaHa, meanNDVI, meanNDRE, imageDate, imageAgeDays, cloudPercentage, barleyPresence } = feature.properties;
         const content = document.createElement("div");
         content.style.cssText = "font-family:'Space Grotesk',sans-serif;color:#333;min-width:180px;padding:4px";
         const title = document.createElement("strong");
@@ -45,6 +45,7 @@ export default function SimpleFieldOverlays({ map, result }: SimpleFieldOverlays
           `${areaHa} ha`,
           `NDVI : ${meanNDVI != null ? meanNDVI.toFixed(2) : "—"} · NDRE : ${meanNDRE != null ? meanNDRE.toFixed(2) : "—"}`,
           `Image : ${imageDate ?? "—"} (${imageAgeDays ?? "?"} j) · nuages ${cloudPercentage ?? "?"}%`,
+          `Présence : ${barleyPresence === "confirmed" ? "confirmée par degrés-jours" : "probable (CNN seul)"}`,
         ].join("<br/>");
         content.append(title, details);
         if (event.latLng) {

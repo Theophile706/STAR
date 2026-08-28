@@ -1,5 +1,6 @@
 import "dotenv/config";
 import "dotenv/config";
+import dns from "node:dns";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import { Prisma, PrismaClient } from "@prisma/client";
@@ -9,6 +10,10 @@ import { detectAutomaticParcels } from "./automatic-parcels.js";
 import { analyzeFieldsSimple, saveSimpleFieldParcelles } from "./barley-detect-simple.js";
 import { fetchSentinel2TilePng } from "./sentinel-tiles.js";
 import { callFieldSegmentationModel } from "./field-segmentation.js";
+
+// Sur certains réseaux (box 4G/domestique), les adresses IPv6 sont annoncées mais peu fiables,
+// ce qui fait échouer/traîner les connexions Prisma vers Neon avant leur timeout. On force IPv4.
+dns.setDefaultResultOrder("ipv4first");
 
 // PNG transparent 1x1, servi quand une tuile Sentinel-2 n'est pas disponible (tuile hors
 // empreinte de la scène, image manquante) pour éviter une icône "image cassée" côté carte.
@@ -24,7 +29,7 @@ const jsonValue = (value: unknown) => value as Prisma.InputJsonValue;
 type ParcelleRow = Awaited<ReturnType<typeof prisma.parcelle.findMany>>[number];
 
 const PARCELLES_CACHE_TTL_MS = 30_000;
-const PARCELLES_QUERY_TIMEOUT_MS = 8_000;
+const PARCELLES_QUERY_TIMEOUT_MS = 20_000;
 
 let parcellesCache: { expiresAt: number; rows: ParcelleRow[] } | null = null;
 let parcellesRequest: Promise<ParcelleRow[]> | null = null;
@@ -79,6 +84,9 @@ const analyzeSimpleSchema = z.object({
   radius: z.number().finite().min(50).max(20_000),
   confidenceThreshold: z.number().finite().min(0.5).max(0.95).optional(),
   minAreaHa: z.number().finite().min(0.01).max(5).optional(),
+  baseTemperature: z.number().finite().min(-20).max(30).optional(),
+  threshold: z.number().finite().min(2200).max(10000).optional(),
+  periodDays: z.number().int().min(1).max(730).optional(),
 });
 const automaticDetectionSchema = z.object({
   lat: z.number().finite().min(-90).max(90),
@@ -232,8 +240,11 @@ app.post("/api/analyze", async (request, reply) => {
   const parsed = analyzeSimpleSchema.safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: "Coordonnées ou rayon invalides.", details: parsed.error.flatten() });
 
-  const { latitude, longitude, radius, confidenceThreshold, minAreaHa } = parsed.data;
-  const result = await analyzeFieldsSimple({ lat: latitude, lng: longitude, radiusM: radius, confidenceThreshold, minAreaHa });
+  const { latitude, longitude, radius, confidenceThreshold, minAreaHa, baseTemperature, threshold, periodDays } = parsed.data;
+  const gddConfig = baseTemperature != null && threshold != null && periodDays != null
+    ? { baseTemperature, threshold, periodDays }
+    : undefined;
+  const result = await analyzeFieldsSimple({ lat: latitude, lng: longitude, radiusM: radius, confidenceThreshold, minAreaHa, gddConfig });
 
   // Enregistre chaque parcelle ORGE détectée dans le registre (table `parcelles`), sinon elle
   // ne survit qu'en mémoire côté frontend et disparaît au rechargement / n'apparaît jamais dans

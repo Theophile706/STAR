@@ -14,6 +14,10 @@ import {
   type GeeValue,
   type LatLng,
 } from "./analyze-parcel.js";
+import {
+  fetchGrowingDegreeDays,
+  type BarleyDetectionConfig,
+} from "./automatic-parcels.js";
 import { Prisma, PrismaClient } from "@prisma/client";
 
 const prisma = new PrismaClient();
@@ -36,11 +40,18 @@ const MAX_IMAGE_AGE_DAYS_FALLBACK = 10;
 const TILE_RADIUS_M = 2_500;
 const MAX_TILES = 40;
 const TILE_CONCURRENCY = 3;
+const CLASSIFY_CONCURRENCY = 3;
 
 const DEFAULT_MIN_AREA_HA = 0.05; // spec §9
 const MAX_CANDIDATE_AREA_M2 = 800_000; // 80 ha, borne réutilisée du reste du code (automatic-parcels.ts)
 const MAX_CANDIDATES_TO_CLASSIFY = 20;
 const DEFAULT_CONFIDENCE_THRESHOLD = 0.7; // spec §7
+
+// Confirmation phénologique (degrés-jours) : mêmes valeurs par défaut que le frontend
+// (frontend/src/lib/barley-detection.ts). Best-effort — ne fait que confirmer une détection
+// CNN déjà positive (barleyPresence "confirmed" vs "probable"), jamais la rejeter : une panne
+// Open-Meteo ne doit pas faire perdre une détection satellite valide.
+const DEFAULT_GDD_CONFIG: BarleyDetectionConfig = { baseTemperature: 0, threshold: 2200, periodDays: 365 };
 
 // Seuils de plausibilité spectrale (pré-filtre avant CNN, spec §8). Valeurs de départ à affiner
 // avec des données de validation — pas une vérité agronomique figée.
@@ -54,6 +65,7 @@ export interface SimpleAnalysisInput {
   radiusM: number;
   confidenceThreshold?: number;
   minAreaHa?: number;
+  gddConfig?: BarleyDetectionConfig;
 }
 
 export interface SimpleFieldFeature {
@@ -68,6 +80,8 @@ export interface SimpleFieldFeature {
     imageDate: string | null;
     imageAgeDays: number | null;
     cloudPercentage: number | null;
+    /** "confirmed" si le cumul de degrés-jours a atteint le seuil (spec agronomique), "probable" sinon (CNN seul). */
+    barleyPresence: "confirmed" | "probable";
   };
 }
 
@@ -85,6 +99,8 @@ export interface SimpleAnalysisResult {
   minAreaHa: number;
   candidatesFound: number;
   candidatesClassified: number;
+  gddCumulative: number | null;
+  gddThreshold: number;
   warnings: string[];
 }
 
@@ -101,7 +117,15 @@ export async function analyzeFieldsSimple(input: SimpleAnalysisInput): Promise<S
   const { lat, lng, radiusM } = input;
   const confidenceThreshold = input.confidenceThreshold ?? DEFAULT_CONFIDENCE_THRESHOLD;
   const minAreaHa = input.minAreaHa ?? DEFAULT_MIN_AREA_HA;
+  const gddConfig = input.gddConfig ?? DEFAULT_GDD_CONFIG;
   const warnings: string[] = [];
+
+  // Démarré tôt et en parallèle du reste (GEE) : indépendant de la fenêtre d'image, ne sert
+  // qu'à confirmer une détection CNN déjà positive, jamais à la rejeter (cf. automatic-parcels.ts).
+  const gddPromise = fetchGrowingDegreeDays(lat, lng, gddConfig).catch((error) => {
+    warnings.push(`Données degrés-jours indisponibles : ${getErrorMessage(error)}`);
+    return null;
+  });
 
   const empty = (): SimpleAnalysisResult => ({
     type: "FeatureCollection", features: [],
@@ -109,6 +133,7 @@ export async function analyzeFieldsSimple(input: SimpleAnalysisInput): Promise<S
     imageDate: null, imageAgeDays: null, cloudPercentage: null, imageTimestampMs: null,
     confidenceThreshold, minAreaHa,
     candidatesFound: 0, candidatesClassified: 0,
+    gddCumulative: null, gddThreshold: gddConfig.threshold,
     warnings,
   });
 
@@ -143,40 +168,43 @@ export async function analyzeFieldsSimple(input: SimpleAnalysisInput): Promise<S
 
   const allCandidates = candidateLists.flat();
   const candidates = dedupeAndRankCandidates(allCandidates).slice(0, MAX_CANDIDATES_TO_CLASSIFY);
+  const gdd = await gddPromise;
 
-  const features: SimpleFieldFeature[] = [];
-  for (const candidate of candidates) {
+  const classifiedFeatures = await mapWithConcurrency(candidates, CLASSIFY_CONCURRENCY, async (candidate): Promise<SimpleFieldFeature | null> => {
     try {
       const center = polygonCentroid(candidate.coordinates);
       const thumbnail = await captureSentinel2ParcelImage(accessToken, projectId, center.lat, center.lng, 17, window.startDate, window.endDate);
       const classification = await callHFModel(thumbnail);
       const confidenceFraction = classification.confidence / 100;
-      if (classification.is_barley && confidenceFraction >= confidenceThreshold) {
-        features.push({
-          type: "Feature",
-          geometry: { type: "Polygon", coordinates: [candidate.coordinates.map((p) => [p.lng, p.lat])] },
-          properties: {
-            class: "ORGE",
-            confidence: Math.round(confidenceFraction * 1000) / 1000,
-            areaHa: Math.round((candidate.areaM2 / 10_000) * 100) / 100,
-            meanNDVI: candidate.ndvi,
-            meanNDRE: candidate.ndre,
-            imageDate: window.imageDate,
-            imageAgeDays: window.imageAgeDays,
-            cloudPercentage: window.cloudPercentage,
-          },
-        });
-      }
+      if (!classification.is_barley || confidenceFraction < confidenceThreshold) return null;
+      return {
+        type: "Feature",
+        geometry: { type: "Polygon", coordinates: [candidate.coordinates.map((p) => [p.lng, p.lat])] },
+        properties: {
+          class: "ORGE",
+          confidence: Math.round(confidenceFraction * 1000) / 1000,
+          areaHa: Math.round((candidate.areaM2 / 10_000) * 100) / 100,
+          meanNDVI: candidate.ndvi,
+          meanNDRE: candidate.ndre,
+          imageDate: window.imageDate,
+          imageAgeDays: window.imageAgeDays,
+          cloudPercentage: window.cloudPercentage,
+          barleyPresence: gdd?.detected === true ? "confirmed" : "probable",
+        },
+      };
     } catch (error) {
       warnings.push(`Classification d'un candidat échouée : ${getErrorMessage(error)}`);
+      return null;
     }
-  }
+  });
+  const features = classifiedFeatures.filter((feature): feature is SimpleFieldFeature => feature !== null);
 
   return {
     type: "FeatureCollection", features,
     center: { lat, lng }, radiusM,
     imageDate: window.imageDate, imageAgeDays: window.imageAgeDays, cloudPercentage: window.cloudPercentage,
     imageTimestampMs: window.imageTimestampMs,
+    gddCumulative: gdd?.cumulative ?? null, gddThreshold: gddConfig.threshold,
     confidenceThreshold, minAreaHa,
     candidatesFound: allCandidates.length, candidatesClassified: candidates.length,
     warnings,
@@ -207,8 +235,9 @@ async function saveSimpleFieldParcelle(feature: SimpleFieldFeature): Promise<voi
   const coordinates: LatLng[] = ring.map(([lng, lat]) => ({ lat, lng }));
   const center = polygonCentroid(coordinates);
   const label = `simple-v1-${center.lat.toFixed(5)}-${center.lng.toFixed(5)}`;
-  const { confidence, areaHa, meanNDVI, meanNDRE, imageDate, imageAgeDays, cloudPercentage } = feature.properties;
+  const { confidence, areaHa, meanNDVI, meanNDRE, imageDate, imageAgeDays, cloudPercentage, barleyPresence } = feature.properties;
   const confidencePercent = Math.round(confidence * 1000) / 10;
+  const presenceLabel = barleyPresence === "confirmed" ? "confirmée par degrés-jours" : "probable (CNN seul)";
 
   const data: Prisma.ParcelleUncheckedCreateInput = {
     label,
@@ -221,7 +250,7 @@ async function saveSimpleFieldParcelle(feature: SimpleFieldFeature): Promise<voi
     ndvi_percentage: meanNDVI != null ? Math.round(meanNDVI * 1000) / 10 : null,
     ndre: meanNDRE,
     confidence: confidencePercent,
-    verdict: `Orge détectée (Sentinel-2, SNIC) — confiance ${confidencePercent}%`,
+    verdict: `Orge détectée (Sentinel-2, SNIC) — confiance ${confidencePercent}% · présence ${presenceLabel}`,
     details: `Image Sentinel-2 du ${imageDate ?? "—"} (${imageAgeDays ?? "?"} j) · nuages ${cloudPercentage ?? "?"}%`,
     saison: null,
     soil_type: null,

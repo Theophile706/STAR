@@ -17,7 +17,7 @@ import { useParcelles } from "@/hooks/useParcelles";
 
 const GOOGLE_MAPS_API_KEY = import.meta.env.VITE_GOOGLE_MAPS_API_KEY;
 
-const DEFAULT_CENTER = { lat: 48.8566, lng: 2.3522 };
+const DEFAULT_CENTER = { lat: -19.848219, lng: 47.011882 };
 const DEFAULT_ZOOM = 4;
 const TARGET_ZOOM = 16;
 const ANALYSIS_VIEWPORT_PADDING = 1.25;
@@ -103,33 +103,12 @@ export default function SatelliteMap() {
       placeCursorMarker(map, { lat: e.latLng.lat(), lng: e.latLng.lng() });
     });
 
-    // Try geolocation
-    if (navigator.geolocation) {
-      navigator.geolocation.getCurrentPosition(
-        (pos) => {
-          const latlng = { lat: pos.coords.latitude, lng: pos.coords.longitude };
-          map.panTo(latlng);
-          map.setZoom(TARGET_ZOOM);
-          placeCursorMarker(map, latlng);
-          setLocated(true);
-        },
-        () => {
-          const latlng = { lat: 47.2, lng: 1.8 };
-          map.panTo(latlng);
-          map.setZoom(TARGET_ZOOM);
-          placeCursorMarker(map, latlng);
-          setLocated(true);
-        }
-      );
-    } else {
-      const latlng = { lat: 47.2, lng: 1.8 };
-      map.panTo(latlng);
-      map.setZoom(TARGET_ZOOM);
-      placeCursorMarker(map, latlng);
-      setLocated(true);
-    }
-
-    // Keep the map ready for the next automatic search.
+    // Ouvre toujours sur le point par défaut (aligné avec CoordinateInput) plutôt que sur la
+    // géolocalisation du navigateur ou un centre générique.
+    map.panTo(DEFAULT_CENTER);
+    map.setZoom(TARGET_ZOOM);
+    placeCursorMarker(map, DEFAULT_CENTER);
+    setLocated(true);
   }, [placeCursorMarker]);
 
   const handleNavigate = useCallback((lat: number, lng: number, radiusKm: number) => {
@@ -174,12 +153,12 @@ export default function SatelliteMap() {
     }
   }, []);
 
-  const handleSimpleSearch = useCallback(async (lat: number, lng: number, radiusM: number, confidenceThreshold: number) => {
+  const handleSimpleSearch = useCallback(async (lat: number, lng: number, radiusM: number, confidenceThreshold: number, gddConfig: BarleyDetectionConfig) => {
     setIsSearchingSimple(true);
     setSimpleSearchError("");
     setSimpleResult(null);
     try {
-      const result = await runSimpleAnalysis(lat, lng, radiusM, { confidenceThreshold });
+      const result = await runSimpleAnalysis(lat, lng, radiusM, { confidenceThreshold, ...gddConfig });
       setSimpleResult(result);
     } catch (error) {
       setSimpleSearchError(error instanceof Error ? error.message : "L'analyse Sentinel-2 a échoué.");

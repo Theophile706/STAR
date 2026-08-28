@@ -79,13 +79,13 @@ npm --prefix backend run prisma:push
 Démarrez le backend dans un terminal :
 
 ```bash
-npm run backend:dev
+npm --prefix backend run dev
 ```
 
 Démarrez ensuite le frontend dans un second terminal :
 
 ```bash
-npm run dev
+npm --prefix frontend run dev
 ```
 
 Le frontend est servi sur le port `8080` et appelle par défaut le backend sur `http://localhost:3001`.
@@ -149,12 +149,13 @@ FRONTEND_ORIGIN=http://localhost:8080
 │   ├── index.html               # Document HTML Vite
 │   ├── vite.config.ts           # Configuration Vite et alias `@/`
 │   ├── tailwind.config.ts       # Thème Tailwind
+│   ├── public/                   # Assets statiques Vite (favicon, logos, robots.txt)
 │   └── package.json             # Dépendances et scripts frontend
 ├── backend/                     # API TypeScript Fastify
 │   ├── prisma/schema.prisma      # Modèle de données PostgreSQL
 │   ├── src/server.ts             # Serveur et routes REST
 │   └── src/analyze-parcel.ts     # Earth Engine, indices et classification
-├── package.json                 # Scripts racine qui relaient frontend/backend
+├── vercel.json                  # Configuration de déploiement (build du frontend)
 └── README.md                    # Documentation du projet
 ```
 
@@ -188,7 +189,7 @@ Le modèle Prisma `Parcelle` est décrit dans `backend/prisma/schema.prisma`. Il
 
 ## Scripts disponibles
 
-### Racine du projet
+### Dossier `frontend`
 
 | Commande | Description |
 | --- | --- |
@@ -197,8 +198,6 @@ Le modèle Prisma `Parcelle` est décrit dans `backend/prisma/schema.prisma`. Il
 | `npm run lint` | Exécute ESLint. |
 | `npm run test` | Lance les tests Vitest une fois. |
 | `npm run test:watch` | Lance Vitest en mode surveillance. |
-| `npm run backend:dev` | Lance le backend en développement. |
-| `npm run backend:build` | Compile le backend TypeScript. |
 
 ### Dossier `backend`
 
@@ -215,6 +214,6 @@ Le modèle Prisma `Parcelle` est décrit dans `backend/prisma/schema.prisma`. Il
 - Utilisez l’alias `@/` pour les imports issus de `frontend/src/`.
 - Les composants métier sont dans `frontend/src/components/` ; conservez les composants génériques dans `frontend/src/components/ui/`.
 - Toute évolution du schéma doit être faite dans `backend/prisma/schema.prisma`, suivie de `npm --prefix backend run prisma:generate`.
-- Exécutez `npm run lint`, `npm run test`, `npm run build` et `npm run backend:build` avant une livraison.
+- Exécutez `npm --prefix frontend run lint`, `npm --prefix frontend run test`, `npm --prefix frontend run build` et `npm --prefix backend run build` avant une livraison.
 - Vérifiez manuellement le parcours principal : chargement de la carte, tracé d’une parcelle, analyse, enregistrement et affichage dans le tableau de bord.
 - En production, définissez `VITE_API_URL` et `FRONTEND_ORIGIN` avec les URL publiques correspondantes et restreignez les clés Google aux services et origines nécessaires.

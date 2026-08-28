@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button";
 import { DEFAULT_BARLEY_DETECTION_CONFIG, type BarleyDetectionConfig } from "@/lib/barley-detection";
 import { getDetectedBarleySegments, type AutomaticParcelSearchResult } from "@/lib/automatic-parcels";
 import type { SimpleAnalysisResult } from "@/lib/barley-detect-simple";
-import { LocateFixed, MapPinned, Navigation, Radar, Satellite, ThermometerSun } from "lucide-react";
+import { LocateFixed, MapPinned, Navigation, Radar, ThermometerSun } from "lucide-react";
 
 interface CoordinateInputProps {
   onNavigate: (lat: number, lng: number, radiusKm: number) => void;
@@ -12,7 +12,7 @@ interface CoordinateInputProps {
   search: AutomaticParcelSearchResult | null;
   isSearching: boolean;
   searchError: string;
-  onSearchSimple: (lat: number, lng: number, radiusKm: number, confidenceThreshold: number) => Promise<void>;
+  onSearchSimple: (lat: number, lng: number, radiusKm: number, confidenceThreshold: number, gddConfig: BarleyDetectionConfig) => Promise<void>;
   simpleResult: SimpleAnalysisResult | null;
   isSearchingSimple: boolean;
   simpleSearchError: string;
@@ -24,10 +24,10 @@ export default function CoordinateInput({
   onSearchSimple, simpleResult, isSearchingSimple, simpleSearchError,
   pickedLocation,
 }: CoordinateInputProps) {
-  const [lat, setLat] = useState("");
-  const [lng, setLng] = useState("");
-  const [radiusValue, setRadiusValue] = useState("10");
-  const [radiusUnit, setRadiusUnit] = useState<"m" | "km">("km");
+  const [lat, setLat] = useState("-19.848219");
+  const [lng, setLng] = useState("47.011882");
+  const [radiusValue, setRadiusValue] = useState("50");
+  const [radiusUnit, setRadiusUnit] = useState<"m" | "km">("m");
   const [baseTemperature, setBaseTemperature] = useState(String(DEFAULT_BARLEY_DETECTION_CONFIG.baseTemperature));
   const [threshold, setThreshold] = useState(String(DEFAULT_BARLEY_DETECTION_CONFIG.threshold));
   const [periodDays, setPeriodDays] = useState("130");
@@ -131,10 +131,27 @@ export default function CoordinateInput({
       setValidationError("Le seuil de confiance doit être compris entre 50 % et 95 %.");
       return;
     }
+    const gddConfig: BarleyDetectionConfig = {
+      baseTemperature: Number(baseTemperature),
+      threshold: Number(threshold),
+      periodDays: Number(periodDays),
+    };
+    if (!Number.isFinite(gddConfig.baseTemperature) || gddConfig.baseTemperature < -20 || gddConfig.baseTemperature > 30) {
+      setValidationError("Tbase doit être compris entre -20 et 30 °C.");
+      return;
+    }
+    if (!Number.isFinite(gddConfig.threshold) || gddConfig.threshold < DEFAULT_BARLEY_DETECTION_CONFIG.threshold || gddConfig.threshold > 10000) {
+      setValidationError("Le seuil nécessaire doit être compris entre 2 200 et 10 000 °C.");
+      return;
+    }
+    if (!Number.isInteger(gddConfig.periodDays) || gddConfig.periodDays < 1 || gddConfig.periodDays > 730) {
+      setValidationError("La période doit être comprise entre 1 et 730 jours.");
+      return;
+    }
 
     setValidationError("");
     onNavigate(latNum, lngNum, radiusNum);
-    await onSearchSimple(latNum, lngNum, radiusNum * 1000, confidencePercentNum / 100);
+    await onSearchSimple(latNum, lngNum, radiusNum * 1000, confidencePercentNum / 100, gddConfig);
   };
 
   if (!expanded) {
@@ -247,19 +264,6 @@ export default function CoordinateInput({
           />
           <span className="mt-1 block text-[10px]">Seules les parcelles classées orge avec au moins cette confiance sont affichées · 50 % à 95 %</span>
         </label>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          className="w-full gap-2"
-          disabled={isSearchingSimple}
-          onClick={handleSimpleSearch}
-        >
-          {isSearchingSimple
-            ? <span key="icon" className="w-3.5 h-3.5 rounded-full border-2 border-primary/40 border-t-primary animate-spin" />
-            : <Satellite key="icon" className="w-4 h-4" />}
-          <span key="label">{isSearchingSimple ? "Analyse Sentinel-2 en cours..." : "Analyse Sentinel-2 (segmentation SNIC)"}</span>
-        </Button>
       </form>
       {simpleSearchError && <p className="mt-2 text-xs text-destructive">{simpleSearchError}</p>}
       {simpleResult && (
@@ -280,6 +284,12 @@ export default function CoordinateInput({
           </div>
           <p className="text-[11px] text-muted-foreground">
             Image Sentinel-2 : {simpleResult.imageDate ?? "—"} ({simpleResult.imageAgeDays ?? "?"} j) · nuages {simpleResult.cloudPercentage ?? "?"}% · seuil de confiance {Math.round(simpleResult.confidenceThreshold * 100)}%
+          </p>
+          <p className="text-[11px] text-muted-foreground">
+            Degrés-jours : {simpleResult.gddCumulative ?? "?"}/{simpleResult.gddThreshold} °C
+            {simpleResult.gddCumulative != null && (simpleResult.gddCumulative >= simpleResult.gddThreshold
+              ? " · présence confirmée"
+              : " · présence probable (CNN seul)")}
           </p>
           {simpleResult.warnings.length > 0 && (
             <div className="rounded-md bg-amber-100/80 px-2 py-1.5 space-y-0.5">
