@@ -45,6 +45,7 @@ model Parcelle {
   cnn_prob_non_barley      Float?
   created_at               DateTime @default(now()) @db.Timestamptz(6)
 
+  @@index([center_lat, center_lng])
   @@map("parcelles")
 }
 

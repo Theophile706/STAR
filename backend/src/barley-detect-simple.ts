@@ -18,9 +18,8 @@ import {
   fetchGrowingDegreeDays,
   type BarleyDetectionConfig,
 } from "./automatic-parcels.js";
-import { Prisma, PrismaClient } from "@prisma/client";
-
-const prisma = new PrismaClient();
+import { Prisma } from "@prisma/client";
+import { prisma } from "./db.js";
 
 // ── Pipeline "Version A" : Sentinel-2 L2A + NDVI/NDRE + segmentation SNIC + CNN externe existant ──
 // Voir /home/tiavina/.claude/plans/recursive-sleeping-goblet.md et

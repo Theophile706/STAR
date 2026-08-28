@@ -184,6 +184,7 @@ export const SNIC_PARAMETERS = {
 const MIN_SEGMENT_AREA_M2 = 2_500;
 const MAX_SEGMENT_AREA_M2 = 500_000;
 const MAX_SEGMENTS_TO_CLASSIFY = 12;
+const SEGMENT_CLASSIFY_CONCURRENCY = 3;
 const MIN_BARLEY_CONFIDENCE = 70;
 const TIME_SERIES_CONCURRENCY = 1;
 export const GEE_COMPUTE_TIMEOUT_MS = 60_000;
@@ -238,9 +239,11 @@ async function detectBarleySegments(
       .slice(0, MAX_SEGMENTS_TO_CLASSIFY);
 
     console.log(`[CLASSIFICATION] Objets envoyés au modèle : ${candidates.length}`);
-    const barleySegments: DetectedSegment[] = [];
 
-    for (const candidate of candidates) {
+    // Chaque candidat est classifié indépendamment (Google Static Maps + modèle HF) :
+    // en série, jusqu'à 12 candidats pouvaient prendre 30-40s. mapWithConcurrency (déjà
+    // utilisé pour les mêmes appels dans barley-detect-simple.ts) ramène ça à ~10-15s.
+    const classifiedSegments = await mapWithConcurrency(candidates, SEGMENT_CLASSIFY_CONCURRENCY, async (candidate): Promise<DetectedSegment | null> => {
       try {
         const center = polygonCentroid(candidate.coordinates);
         const thumbnail = await captureParcelImage(
@@ -251,17 +254,20 @@ async function detectBarleySegments(
         );
         const classification = await callHFModel(thumbnail);
         if (classification.is_barley && classification.confidence >= MIN_BARLEY_CONFIDENCE) {
-          barleySegments.push({
+          return {
             coordinates: candidate.coordinates,
             confidence: Math.round(classification.confidence),
             ndvi: candidate.ndvi,
             area_ha: Math.round((candidate.areaM2 / 10_000) * 100) / 100,
-          });
+          };
         }
+        return null;
       } catch (error) {
         console.warn("[CLASSIFICATION] Échec de la classification d'un objet :", error);
+        return null;
       }
-    }
+    });
+    const barleySegments = classifiedSegments.filter((segment): segment is DetectedSegment => segment !== null);
 
     console.log(`[CLASSIFICATION] Orge détectée : ${barleySegments.length}`);
     return barleySegments;

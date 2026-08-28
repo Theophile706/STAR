@@ -3,6 +3,7 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { DEFAULT_BARLEY_DETECTION_CONFIG, type BarleyDetectionConfig } from "@/lib/barley-detection";
 import { getDetectedBarleySegments, type AutomaticParcelSearchResult } from "@/lib/automatic-parcels";
+import { SOURCE_LABELS } from "@/components/AutomaticParcelOverlays";
 import type { SimpleAnalysisResult } from "@/lib/barley-detect-simple";
 import { LocateFixed, MapPinned, Navigation, Radar, ThermometerSun } from "lucide-react";
 
@@ -307,6 +308,13 @@ export default function CoordinateInput({
             <p className="text-sm font-semibold text-foreground">Résultat de la zone</p>
             <span className="text-xs font-mono text-muted-foreground">{formatGroundRadius(search.radius_km)}</span>
           </div>
+          {search.parcels.length > 0 && (
+            <p className="text-[11px] text-muted-foreground">
+              Origine des contours : <span className="font-medium text-foreground">
+                {SOURCE_LABELS[search.parcels[0]?.tags.source ?? ""] ?? "Contour détecté"}
+              </span>
+            </p>
+          )}
           <div className="grid grid-cols-2 gap-2 text-center">
             <div className="rounded-md bg-background/60 p-2">
               <p className="text-lg font-semibold text-foreground">{search.candidates_found}</p>

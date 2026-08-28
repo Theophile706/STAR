@@ -25,7 +25,8 @@ import {
   traceLabelContours,
   watershedSegment,
 } from "./field-watershed.js";
-import { Prisma, PrismaClient } from "@prisma/client";
+import { Prisma } from "@prisma/client";
+import { prisma } from "./db.js";
 
 export interface BarleyDetectionConfig {
   baseTemperature: number;
@@ -76,7 +77,6 @@ const MAX_CANDIDATES = 48;
 const MAX_SATELLITE_CELLS = 36;
 const ANALYSIS_CONCURRENCY = 4;
 const ANALYSIS_TIME_BUDGET_MS = 60_000;
-const prisma = new PrismaClient();
 
 // Empêche un appel qui ne répond jamais (DB endormie, réseau qui pend) de bloquer toute
 // la chaîne de découverte — sans ça, une seule étape lente empêche les suivantes (dont
@@ -1009,7 +1009,7 @@ async function discoverAgriculturalParcelsFromOverpass(lat: number, lng: number,
           lat: closedCoordinates.reduce((sum, point) => sum + point.lat, 0) / closedCoordinates.length,
           lng: closedCoordinates.reduce((sum, point) => sum + point.lng, 0) / closedCoordinates.length,
         };
-        return [{ id: `osm-way-${item.id}`, coordinates: closedCoordinates, center, tags: item.tags ?? {} }];
+        return [{ id: `osm-way-${item.id}`, coordinates: closedCoordinates, center, tags: { ...(item.tags ?? {}), source: "osm" } }];
       });
       const candidates = parsed.filter((candidate) => isParcelWithinRadius(candidate, { lat, lng }, radiusKm));
       if (candidates.length > 0) return candidates;
@@ -1062,7 +1062,7 @@ async function discoverAgriculturalParcelsFromDatabase(lat: number, lng: number,
       lat: coordinates.reduce((sum, point) => sum + point.lat, 0) / coordinates.length,
       lng: coordinates.reduce((sum, point) => sum + point.lng, 0) / coordinates.length,
     };
-    const candidate = { id: row.id, coordinates, center, tags: {} };
+    const candidate = { id: row.id, coordinates, center, tags: { source: "database" } };
     return isParcelWithinRadius(candidate, { lat, lng }, radiusKm) ? [candidate] : [];
   });
 }

@@ -6,10 +6,13 @@ interface AutomaticParcelOverlaysProps {
   parcels: AutomaticParcel[];
 }
 
-const SOURCE_LABELS: Record<string, string> = {
+export const SOURCE_LABELS: Record<string, string> = {
+  "osm": "Contour OSM (réel)",
+  "database": "Parcelle enregistrée",
   "field-boundary-model": "Modèle IA (U-Net)",
   "gee-watershed-segmentation": "Watershed (GEE)",
   "gee-snic-segmentation": "SNIC (GEE)",
+  "satellite-search-cell": "Fenêtre satellite (sans contour)",
 };
 
 export default function AutomaticParcelOverlays({ map, parcels }: AutomaticParcelOverlaysProps) {

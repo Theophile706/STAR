@@ -3,13 +3,14 @@ import "dotenv/config";
 import dns from "node:dns";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
-import { Prisma, PrismaClient } from "@prisma/client";
+import { Prisma } from "@prisma/client";
 import { z } from "zod";
 import { analyzeParcel, getGeeAccessToken, getGeeProjectId } from "./analyze-parcel.js";
 import { detectAutomaticParcels } from "./automatic-parcels.js";
 import { analyzeFieldsSimple, saveSimpleFieldParcelles } from "./barley-detect-simple.js";
 import { fetchSentinel2TilePng } from "./sentinel-tiles.js";
 import { callFieldSegmentationModel } from "./field-segmentation.js";
+import { prisma } from "./db.js";
 
 // Sur certains réseaux (box 4G/domestique), les adresses IPv6 sont annoncées mais peu fiables,
 // ce qui fait échouer/traîner les connexions Prisma vers Neon avant leur timeout. On force IPv4.
@@ -23,7 +24,6 @@ const TRANSPARENT_PNG = Buffer.from(
 );
 
 const app = Fastify({ logger: true });
-const prisma = new PrismaClient();
 
 const jsonValue = (value: unknown) => value as Prisma.InputJsonValue;
 type ParcelleRow = Awaited<ReturnType<typeof prisma.parcelle.findMany>>[number];
@@ -35,25 +35,34 @@ let parcellesCache: { expiresAt: number; rows: ParcelleRow[] } | null = null;
 let parcellesRequest: Promise<ParcelleRow[]> | null = null;
 
 async function loadParcelles(): Promise<ParcelleRow[]> {
-  const now = Date.now();
-  if (parcellesCache && parcellesCache.expiresAt > now) return parcellesCache.rows;
+  if (parcellesCache) {
+    // Cache expiré mais présent : on sert la version connue tout de suite et on
+    // rafraîchit en arrière-plan, pour ne jamais faire attendre une requête
+    // utilisateur sur la latence Neon (souvent plusieurs secondes sur ce réseau).
+    if (parcellesCache.expiresAt <= Date.now()) refreshParcellesInBackground();
+    return parcellesCache.rows;
+  }
+  return fetchParcelles();
+}
+
+function refreshParcellesInBackground(): void {
+  if (parcellesRequest) return;
+  fetchParcelles().catch((error) => {
+    app.log.warn({ err: error }, "parcelles: background refresh failed, keeping stale cache");
+  });
+}
+
+async function fetchParcelles(): Promise<ParcelleRow[]> {
   if (!parcellesRequest) {
     parcellesRequest = withTimeout(
       prisma.parcelle.findMany({ orderBy: { created_at: "desc" } }),
       PARCELLES_QUERY_TIMEOUT_MS,
     );
   }
-
   try {
     const rows = await parcellesRequest;
     parcellesCache = { rows, expiresAt: Date.now() + PARCELLES_CACHE_TTL_MS };
     return rows;
-  } catch (error) {
-    if (parcellesCache) {
-      app.log.warn({ err: error }, "parcelles: database unavailable, serving cached rows");
-      return parcellesCache.rows;
-    }
-    throw error;
   } finally {
     parcellesRequest = null;
   }
@@ -364,4 +373,10 @@ app.listen({ port, host }).catch(async (error) => {
   app.log.error(error);
   await prisma.$disconnect();
   process.exit(1);
+});
+
+// Préchauffe la connexion Neon et le cache au démarrage : sans ça, c'est la première
+// requête utilisateur qui paie le coût de connexion initial (plusieurs secondes ici).
+loadParcelles().catch((error) => {
+  app.log.warn({ err: error }, "parcelles: préchauffage initial échoué, réessai à la première requête");
 });
